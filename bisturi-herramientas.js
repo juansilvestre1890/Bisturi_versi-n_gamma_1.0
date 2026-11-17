@@ -1,8 +1,10 @@
 // Herramientas Bisturí.
 //  · Bisturí: cada línea dibujada crea un plano de corte (un cuadrado en la vista). Se pueden
 //    dibujar varios; el corte se hace al pulsar «Hacer el corte plano».
-//  · Bisturí libre: se rodea una zona con el dedo y sale una pieza con esa forma y la
-//    profundidad indicada.
+//  · Bisturí libre: se rodea una zona con puntos y queda marcada en verde (la parte que la app
+//    reconoce, o lo que encierra el contorno). Se puede sumar otro contorno desde otra vista,
+//    corregir con «Añadir»/«Quitar» o partir de lo pintado con el Pincel; «Hacer el corte»
+//    la separa exacta por su borde. Con una profundidad escrita corta como molde.
 // Un dedo dibuja; con dos dedos se gira y se acerca la vista como siempre.
 import earcut from './earcut.js';
 
@@ -81,11 +83,23 @@ export function setupBisturi(ctx) {
     planos.push({ normal, point, cuadrado: { centro: centro.toArray(), u: u.toArray(), w: w.toArray(), mitad: L / 2, mitadW: D / 2 }, malla });
     infoPlanos();
     ctx.status(`Plano ${planos.length} creado (${L.toFixed(1)} mm). Dibuja más o pulsa «Hacer el corte plano».`);
+    if (modo === 'plano') ctx.abrirVista();
   }
 
-  $('bisturiBorrar').onclick = () => { borrarPlanos(); ctx.status('Planos borrados.'); };
+  $('bisturiBorrar').onclick = () => { ctx.cerrarVista(false); borrarPlanos(); ctx.status('Planos borrados.'); };
+  // «Explosión» en el Bisturí: vista previa del corte con los planos dibujados.
+  const vista = ctx.vistaPorCorte(async () => {
+    if (!planos.length) { ctx.status('Primero dibuja al menos una línea sobre la figura.'); return false; }
+    const r = await ctx.cutWithPlanes(planos.map(p => ({ normal: p.normal, point: p.point, cuadrado: p.cuadrado })), objetivos());
+    if (r.hechos) grupoPlanos.visible = false;
+    return r.hechos > 0;
+  });
+  vista.texto = 'Vista previa del corte lista: marca «Demostración» y mueve el deslizador para ver las piezas separadas. «Hacer el corte plano» corta; un toque en la vista vuelve a dibujar.';
+  const vistaOrig = vista.terminar.bind(vista);
+  vista.terminar = conservar => { grupoPlanos.visible = true; const r = vistaOrig(conservar); if (conservar) borrarPlanos(); return r; };
   $('bisturiCortar').onclick = async () => {
     if (ocupado) return;
+    if (ctx.enVista) { ctx.cerrarVista(true); ctx.status('Corte hecho tal como lo viste en la vista previa. «Deshacer» lo devuelve.'); return; }
     if (!planos.length) return ctx.status('Primero dibuja al menos una línea sobre la figura.');
     if (ctx.busy()) return ctx.status('Vuelve a la vista ensamblada del modelo y desactiva Rayos X.');
     ocupado = true; $('bisturiCortar').disabled = true;
@@ -128,12 +142,130 @@ export function setupBisturi(ctx) {
       const ref = nodos.length ? nodos[nodos.length - 1] : cajaDe(lista).getCenter(new THREE.Vector3()), z = ref.clone().sub(C).dot(f);
       v = C.clone().addScaledVector(r.ray.direction, z / r.ray.direction.dot(f));
     }
-    nodos.push(v); infoNodos(); dibujarNodos();
+    nodos.push(v); infoNodos(); dibujarNodos(); actualizarBarraLibre();
   }
-  const borrarNodos = () => { nodos.length = 0; infoNodos(); limpiarCapa(); };
-  $('bisturiCerrar').onclick = () => { if (nodos.length < 3) return ctx.status('Pon al menos 3 puntos alrededor de la zona.'); corteLibre(); };
-  $('bisturiQuitarPunto').onclick = () => { nodos.pop(); infoNodos(); dibujarNodos(); };
+  const borrarNodos = () => { nodos.length = 0; infoNodos(); limpiarCapa(); if (typeof actualizarBarraLibre === 'function') actualizarBarraLibre(); };
+  $('bisturiCerrar').onclick = () => { if (nodos.length < 3) return ctx.status('No se pudo cerrar: pon al menos 3 puntos alrededor de la zona.'); corteLibre(); };
+  $('bisturiQuitarPunto').onclick = () => { nodos.pop(); infoNodos(); dibujarNodos(); actualizarBarraLibre(); };
   $('bisturiBorrarPuntos').onclick = () => { borrarNodos(); ctx.status('Puntos borrados.'); };
+
+  // ---------- zona de corte (verde) ----------
+  let zona = null, pincelZona = null, pintando = null;
+  const cacheMalla = new WeakMap();
+  function datosMalla(mesh) {
+    const g = mesh.geometry; let d = cacheMalla.get(g); if (d) return d;
+    const P = g.attributes.position.array, I = g.index ? g.index.array : null, n = (I ? I.length : P.length / 3) / 3;
+    const tri = I || Uint32Array.from({ length: n * 3 }, (_, i) => i), cent = new Float32Array(n * 3), nrm = new Float32Array(n * 3);
+    const clave = v => Math.round(P[3 * v] * 1e4) + ',' + Math.round(P[3 * v + 1] * 1e4) + ',' + Math.round(P[3 * v + 2] * 1e4);
+    const aristas = new Map(), adj = Array.from({ length: n }, () => []);
+    for (let f = 0; f < n; f++) {
+      const a = 3 * tri[3 * f], b = 3 * tri[3 * f + 1], c = 3 * tri[3 * f + 2];
+      cent[3 * f] = (P[a] + P[b] + P[c]) / 3; cent[3 * f + 1] = (P[a + 1] + P[b + 1] + P[c + 1]) / 3; cent[3 * f + 2] = (P[a + 2] + P[b + 2] + P[c + 2]) / 3;
+      const ux = P[b] - P[a], uy = P[b + 1] - P[a + 1], uz = P[b + 2] - P[a + 2], vx = P[c] - P[a], vy = P[c + 1] - P[a + 1], vz = P[c + 2] - P[a + 2];
+      let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx; const l = Math.hypot(nx, ny, nz) || 1; nrm[3 * f] = nx / l; nrm[3 * f + 1] = ny / l; nrm[3 * f + 2] = nz / l;
+      for (let k = 0; k < 3; k++) { const x = clave(tri[3 * f + k]), y = clave(tri[3 * f + (k + 1) % 3]), key = x < y ? x + '|' + y : y + '|' + x; const o = aristas.get(key); if (o === undefined) aristas.set(key, f); else { adj[f].push(o); adj[o].push(f); } }
+    }
+    d = { P, tri, n, cent, nrm, adj }; cacheMalla.set(g, d); return d;
+  }
+  const verZona = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({ color: 0x2ee67a, transparent: true, opacity: .5, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }));
+  verZona.matrixAutoUpdate = false; verZona.visible = false; verZona.renderOrder = 25; verZona.raycast = () => {}; scene.add(verZona);
+  const cuentaZona = () => zona ? zona.caras.reduce((s, x) => s + x, 0) : 0;
+  function zonaValida() { if (ctx.enVista) return !!zona; // durante la vista previa la pieza está cortada de forma provisional
+    if (zona && (!ctx.meshes.includes(zona.target) || zona.target.geometry !== zona.geo)) zona = null; return !!zona; }
+  function dibujarZona() {
+    zonaValida();
+    const n = cuentaZona();
+    if (!zona || !n) { verZona.visible = false; actualizarBarraLibre(); return; }
+    const d = datosMalla(zona.target), pos = new Float32Array(n * 9); let k = 0;
+    for (let f = 0; f < d.n; f++) if (zona.caras[f]) for (let j = 0; j < 3; j++) { const v = 3 * d.tri[3 * f + j]; pos[k++] = d.P[v]; pos[k++] = d.P[v + 1]; pos[k++] = d.P[v + 2]; }
+    verZona.geometry.dispose(); verZona.geometry = new THREE.BufferGeometry(); verZona.geometry.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    zona.target.updateWorldMatrix(true, false); verZona.matrix.copy(zona.target.matrixWorld); verZona.matrixWorldNeedsUpdate = true; verZona.visible = !ctx.enVista;
+    actualizarBarraLibre();
+  }
+  function ponerZona(target, caras, sumar = true) {
+    zonaValida();
+    if (ctx.enVista) ctx.cerrarVista(false);
+    if (zona && sumar && zona.target === target) { for (let f = 0; f < caras.length; f++) if (caras[f]) zona.caras[f] = 1; }
+    else zona = { target, geo: target.geometry, caras: Uint8Array.from(caras) };
+    dibujarZona(); ctx.abrirVista();
+  }
+  function borrarZona() { if (ctx.enVista) ctx.cerrarVista(false); zona = null; pincelZona = null; dibujarZona(); }
+  // Lo pintado con el Pincel (zona amarilla) pasa a ser la zona de corte.
+  function zonaDesdePincel() {
+    const lista = ctx.meshes.filter(m => m.visible && !m.userData.bisturiAlignmentPin), pref = ctx.selected && lista.includes(ctx.selected) ? [ctx.selected, ...lista] : lista;
+    for (const m of pref) {
+      const sel = window.bisturi?.surfaceFaces?.(m); if (!sel || !sel.size) continue;
+      const d = datosMalla(m), caras = new Uint8Array(d.n); for (const f of sel) if (f < d.n) caras[f] = 1;
+      ponerZona(m, caras, false); ctx.status(`Zona del Pincel lista para cortar en «${m.name}».`); return true;
+    }
+    return false;
+  }
+  // Sin nada que reconocer: lo que encierra el contorno, por el lado que mira la cámara.
+  function zonaPorContorno(objetivo, q, semillas) {
+    const d = datosMalla(objetivo); objetivo.updateWorldMatrix(true, false);
+    const M = objetivo.matrixWorld, cam = camera.position.clone().applyMatrix4(M.clone().invert()), r = lienzo.getBoundingClientRect(), v = new THREE.Vector3();
+    const dentro = (x, y) => { let c = false; for (let i = 0, j = q.length - 1; i < q.length; j = i++) { const a = q[i], b = q[j]; if ((a.y > y) !== (b.y > y) && x < (b.x - a.x) * (y - a.y) / (b.y - a.y) + a.x) c = !c; } return c; };
+    const vale = f => {
+      const cx = d.cent[3 * f], cy = d.cent[3 * f + 1], cz = d.cent[3 * f + 2];
+      if (d.nrm[3 * f] * (cam.x - cx) + d.nrm[3 * f + 1] * (cam.y - cy) + d.nrm[3 * f + 2] * (cam.z - cz) <= 0) return false;
+      v.set(cx, cy, cz).applyMatrix4(M).project(camera); return dentro((v.x + 1) / 2 * r.width, (1 - v.y) / 2 * r.height);
+    };
+    const caras = new Uint8Array(d.n), pila = [];
+    for (const f of semillas) if (f != null && f < d.n && !caras[f] && vale(f)) { caras[f] = 1; pila.push(f); }
+    while (pila.length) { const f = pila.pop(); for (const g of d.adj[f]) if (!caras[g] && vale(g)) { caras[g] = 1; pila.push(g); } }
+    return caras;
+  }
+  // «Añadir» / «Quitar»: pincel sobre la zona.
+  function pintarZona(e) {
+    const lista = zonaValida() ? [zona.target] : ctx.meshes.filter(m => m.visible && !m.userData.bisturiAlignmentPin);
+    const h = rayo(punto(e)).intersectObjects(lista, false)[0]; if (!h || h.faceIndex == null) return;
+    if (!zona) { if (pincelZona === 'quitar') return; zona = { target: h.object, geo: h.object.geometry, caras: new Uint8Array(datosMalla(h.object).n) }; }
+    const d = datosMalla(zona.target), M = zona.target.matrixWorld, pl = h.point.clone().applyMatrix4(M.clone().invert());
+    const r = lienzo.getBoundingClientRect(), dist = camera.position.distanceTo(h.point), escala = new THREE.Vector3(); zona.target.getWorldScale(escala);
+    const R = (camera.isPerspectiveCamera ? 2 * dist * Math.tan(camera.fov * Math.PI / 360) / r.height : (camera.top - camera.bottom) / camera.zoom / r.height) * 22 / ((escala.x + escala.y + escala.z) / 3), R2 = R * R;
+    const valor = pincelZona === 'quitar' ? 0 : 1, visto = new Set([h.faceIndex]), pila = [h.faceIndex];
+    while (pila.length) {
+      const f = pila.pop(); zona.caras[f] = valor;
+      for (const g of d.adj[f]) { if (visto.has(g)) continue; visto.add(g); const dx = d.cent[3 * g] - pl.x, dy = d.cent[3 * g + 1] - pl.y, dz = d.cent[3 * g + 2] - pl.z; if (dx * dx + dy * dy + dz * dz <= R2) pila.push(g); }
+    }
+    dibujarZona();
+  }
+  const zonaPara = () => ({ modo: 'zona', caras: zona.caras, target: zona.target, geometria: zona.geo });
+  // Vista previa (Demostración) del corte por la zona.
+  const vistaLibre = ctx.vistaPorCorte(async () => { if (!zonaValida() || !cuentaZona()) return false; await ctx.applyFreeZone(zonaPara()); return true; });
+  vistaLibre.texto = 'Vista previa: así quedaría la pieza. Pulsa «Hacer el corte» para separarla.';
+  { const vI = vistaLibre.iniciar.bind(vistaLibre), vT = vistaLibre.terminar.bind(vistaLibre);
+    vistaLibre.iniciar = async () => { verZona.visible = false; const ok = await vI(); if (!ok) dibujarZona(); return ok; };
+    vistaLibre.terminar = c => { const r = vT(c); if (c) zona = null; dibujarZona(); return r; }; }
+  async function cortarZona() {
+    if (!ocupado && ctx.enVista && zona) { ctx.cerrarVista(true); ctx.status('Pieza separada por el borde de la zona. «Deshacer» la devuelve.'); return; }
+    if (ocupado || !zonaValida() || !cuentaZona()) return ctx.status('No se pudo cortar: primero marca la zona (contorno, «Añadir» o el Pincel).');
+    ocupado = true; const f = camera.getWorldDirection(new THREE.Vector3());
+    try { await ctx.applyFreeZone(zonaPara()); zona = null; pincelZona = null; dibujarZona(); ctx.status('Pieza separada por el borde de la zona; queda en su sitio. «Deshacer» la une de nuevo.'); }
+    catch (e) { console.error(e); ctx.status('No se pudo cortar la zona: ' + e.message); }
+    finally { ocupado = false; }
+  }
+  // Botones de la zona (en la barra del bisturí libre).
+  const boton = (texto, clase, fn) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = texto; if (clase) b.className = clase; b.onclick = fn; return b; };
+  const bAnadir = boton('Añadir', 'secondary', () => { pincelZona = pincelZona === 'anadir' ? null : 'anadir'; if (pincelZona && ctx.enVista) ctx.cerrarVista(false); actualizarBarraLibre(); });
+  const bQuitar = boton('Quitar', 'secondary', () => { pincelZona = pincelZona === 'quitar' ? null : 'quitar'; if (pincelZona && ctx.enVista) ctx.cerrarVista(false); actualizarBarraLibre(); });
+  const bBorrarZona = boton('Borrar zona', 'secondary', () => { borrarZona(); ctx.status('Zona borrada.'); });
+  const bCortarZona = boton('Hacer el corte', '', () => cortarZona());
+  const bMas = boton('Más opciones', 'secondary', () => {
+    // Curva ajustable y superficie guardada (antes en «Corte curvo»).
+    const lanz = [...document.querySelectorAll('#almacen button, .left .tools > button')].find(b => /curvo/i.test(b.textContent)) || document.getElementById('curvedCutBtn');
+    lanz?.click(); const modo2 = document.getElementById('curveMode'); if (modo2) { modo2.value = 'manual'; modo2.dispatchEvent(new Event('change')); }
+  });
+  function actualizarBarraLibre() {
+    const hayZona = cuentaZona() > 0;
+    bAnadir.classList.toggle('activo', pincelZona === 'anadir'); bQuitar.classList.toggle('activo', pincelZona === 'quitar');
+    bQuitar.hidden = bBorrarZona.hidden = bCortarZona.hidden = !hayZona;
+    $('bisturiQuitarPunto').hidden = $('bisturiBorrarPuntos').hidden = $('bisturiCerrar').hidden = !nodos.length;
+    lienzo.style.cursor = modo === 'libre' && pincelZona ? 'cell' : modo ? 'crosshair' : '';
+    if (modo === 'libre') $('bisturiLibreInfo').textContent = pincelZona ? (pincelZona === 'anadir' ? 'Añadir: pinta sobre la figura. Tócalo otra vez para dejar de pintar.' : 'Quitar: pinta sobre la zona verde. Tócalo otra vez para dejar de pintar.')
+      : nodos.length ? $('bisturiLibreInfo').textContent
+      : hayZona ? 'Zona verde lista. Puedes sumar otro contorno, corregir o «Hacer el corte».' : 'Toca alrededor de la zona para poner puntos, o usa «Añadir».';
+  }
 
   // ---------- detección automática: vista previa y pregunta ----------
   let deteccion = null, vistaDet = null;
@@ -167,9 +299,9 @@ export function setupBisturi(ctx) {
     const { det, f } = deteccion; quitarDeteccion();
     ocupado = true; ctx.status('Separando la pieza…'); await new Promise(r => requestAnimationFrame(() => setTimeout(r, 30)));
     try {
-      await ctx.applyFreeZone(det, { dir: f.clone().negate() });
+      await ctx.applyFreeZone(det);
       ocupado = false; borrarNodos();
-      ctx.status(det.modo === 'cuerpo' ? 'Pieza suelta separada entera y apartada hacia ti; «Deshacer» la devuelve.' : 'Pieza separada por su borde y apartada hacia ti; encaja en su sitio porque comparten la misma cara de corte. «Deshacer» la devuelve.');
+      ctx.status(det.modo === 'cuerpo' ? 'Pieza suelta separada entera; queda en su sitio.' : 'Pieza separada por su borde; queda en su sitio. «Deshacer» la une de nuevo.');
     } catch (e) {
       console.error(e); ocupado = false;
       ctx.status('No pude separar lo detectado (' + e.message + '). Corto con tu contorno.');
@@ -184,8 +316,10 @@ export function setupBisturi(ctx) {
     if (q.some(p => !p.delante)) return ctx.status('Algún punto quedó detrás de la cámara: gira la vista para ver todo el contorno.');
     let area = 0; for (let i = 0; i < q.length; i++) { const a = q[i], b = q[(i + 1) % q.length]; area += a.x * b.y - b.x * a.y; }
     if (Math.abs(area / 2) < 150) return ctx.status('La zona es muy pequeña o los puntos están en línea: ponlos alrededor de la zona.');
-    const profundidad = Number($('bisturiProfundidad').value);
-    if (!(profundidad > 0)) return ctx.status('Indica una profundidad mayor que 0 mm.');
+    // Profundidad vacía («Auto»): la zona sigue la superficie y se corta por su borde.
+    // Con un número: corte como molde, con la forma del contorno hacia dentro.
+    const profundidad = Number(String($('bisturiProfundidad').value).replace(',', '.'));
+    const molde = profundidad > 0;
     // Pieza tocada: la que más veces recibe el trazo y su interior.
     const lista = ctx.meshes.filter(m => m.visible); if (!lista.length) return ctx.status('Abre un modelo para usar el bisturí.');
     let mnx = Infinity, mny = Infinity, mxx = -Infinity, mxy = -Infinity; for (const p of q) { mnx = Math.min(mnx, p.x); mny = Math.min(mny, p.y); mxx = Math.max(mxx, p.x); mxy = Math.max(mxy, p.y); }
@@ -200,7 +334,7 @@ export function setupBisturi(ctx) {
     const objetivo = [...votos].sort((a, b) => b[1] - a[1])[0][0];
     const f = camera.getWorldDirection(new THREE.Vector3()), C = camera.position.clone();
     // Primero se intenta reconocer la parte rodeada: pieza suelta, zona de color o surco.
-    if (!usarContorno) {
+    if (!molde) {
       ocupado = true; ctx.status('Buscando qué parte rodeaste…'); await new Promise(r => requestAnimationFrame(() => setTimeout(r, 30)));
       let det = null;
       try {
@@ -210,7 +344,13 @@ export function setupBisturi(ctx) {
         det = ctx.detectFreeZone(objetivo, q.map(p => ({ x: p.x, y: p.y })), { interior: caras.filter(x => !x[1]).map(x => x[0].faceIndex), borde: caras.filter(x => x[1]).map(x => x[0].faceIndex), centro: hc?.faceIndex ?? null });
       } catch (e) { console.warn(e); }
       ocupado = false;
-      if (det) return mostrarDeteccion(det, f);
+      const textos = { cuerpo: 'Encontré una pieza suelta dentro del contorno.', color: 'Encontré una zona de otro color.', forma: 'Encontré una parte rodeada por un surco.' };
+      let caras = det ? det.caras : null;
+      if (!caras) caras = zonaPorContorno(objetivo, q, golpes.filter(h => h.object === objetivo).map(h => h.faceIndex));
+      if (!caras.some(x => x)) return ctx.status('No se pudo marcar la zona: el contorno no encierra ninguna parte visible de la figura.');
+      ponerZona(objetivo, caras, true); borrarNodos(); actualizarBarraLibre();
+      ctx.status((det ? textos[det.modo] + ' ' : '') + 'La zona quedó en verde. Corrígela con «Añadir»/«Quitar», suma otro contorno o pulsa «Hacer el corte».');
+      return;
     }
     let zMin = Infinity, zMax = -Infinity;
     for (const h of golpes) if (h.object === objetivo) { const z = h.point.clone().sub(C).dot(f); zMin = Math.min(zMin, z); zMax = Math.max(zMax, z); }
@@ -253,8 +393,8 @@ export function setupBisturi(ctx) {
     const cortadores = { hueco: solido(contorno, zNear, zFar), pieza: solido(encoger(contorno, holgura), zNear - 0.5, zFar - holgura) };
     ocupado = true; ctx.status('Cortando la pieza…'); await new Promise(r => requestAnimationFrame(() => setTimeout(r, 30)));
     try {
-      const r = await ctx.cutFreeShape(objetivo, cortadores, { dir: f.clone().negate(), distance: profundidad + 10 });
-      ctx.status(`Pieza sacada con ${profundidad} mm de profundidad y ${holgura} mm de holgura: vuelve a entrar en su hueco empujándola en la misma dirección en que salió. «Deshacer» la devuelve.` + (r.cerrada ? '' : ' Tiene algún borde abierto: revísala en el laminador.'));
+      const r = await ctx.cutFreeShape(objetivo, cortadores, null);
+      ctx.status(`Pieza sacada con ${profundidad} mm de profundidad y ${holgura} mm de holgura: queda en su sitio, dentro de su hueco. «Deshacer» la devuelve.` + (r.cerrada ? '' : ' Tiene algún borde abierto: revísala en el laminador.'));
     } catch (e) { console.error(e); ctx.status('No se pudo sacar la pieza: ' + e.message); }
     finally { ocupado = false; cortadores.hueco.dispose(); cortadores.pieza.dispose(); borrarNodos(); }
   }
@@ -271,10 +411,15 @@ export function setupBisturi(ctx) {
   }
   caja.addEventListener('pointerdown', e => {
     if (!modo || (e.target !== lienzo && !e.__bisturiPasa)) return; // solo los toques sobre la vista 3D
+    if (ctx.enVista) { toqueVista = { x: e.clientX, y: e.clientY }; return; } // en la vista previa, arrastrar gira la vista; un toque la cierra para dibujar
     activos.add(e.pointerId);
     if (pasar || e.__bisturiPasa) return;
     if (e.pointerType === 'mouse' && e.button !== 0) return; // botón derecho o rueda: vista
     if (ocupado) { e.stopPropagation(); return; }
+    if (modo === 'libre' && pincelZona && !trazo) {
+      e.stopPropagation(); e.preventDefault(); pintando = e.pointerId; try { caja.setPointerCapture(e.pointerId); } catch (_) {}
+      pintarZona(e); return;
+    }
     if (!trazo) {
       e.stopPropagation(); e.preventDefault();
       primero = e; trazo = [punto(e)];
@@ -285,6 +430,7 @@ export function setupBisturi(ctx) {
     cederVista();
   }, { capture: true });
   caja.addEventListener('pointermove', e => {
+    if (pintando === e.pointerId) { e.stopPropagation(); pintarZona(e); return; }
     if (!modo || pasar || !trazo || e.pointerId !== primero.pointerId) return;
     const p = punto(e);
     // Bisturí libre: arrastrar un dedo gira la vista (los puntos se ponen tocando).
@@ -295,6 +441,7 @@ export function setupBisturi(ctx) {
   }, { capture: true });
   const fin = e => {
     activos.delete(e.pointerId);
+    if (pintando === e.pointerId) { pintando = null; e.stopPropagation(); try { caja.releasePointerCapture(e.pointerId); } catch (_) {} return; }
     if (pasar) { if (!activos.size) pasar = false; return; }
     if (!modo || !trazo || e.pointerId !== primero.pointerId) return;
     e.stopPropagation();
@@ -305,13 +452,19 @@ export function setupBisturi(ctx) {
     else tocarNodo(a);
   };
   caja.addEventListener('pointerup', fin, { capture: true });
+  let toqueVista = null;
+  caja.addEventListener('pointerup', e => {
+    if (!toqueVista) return; const t = toqueVista; toqueVista = null;
+    if (modo === 'plano' && ctx.enVista && Math.hypot(e.clientX - t.x, e.clientY - t.y) < 6) { ctx.cerrarVista(false); ctx.status('Modelo armado: dibuja la siguiente línea. La vista previa vuelve sola al crear el plano.'); }
+  }, { capture: true });
   caja.addEventListener('pointercancel', fin, { capture: true });
 
   // ---------- barras sobre la vista (en lugar del panel lateral) ----------
   // Abajo: los botones de la herramienta activa. Arriba (bisturí libre): profundidad y holgura.
   const barra = (clase, nodosB) => { const d = document.createElement('div'); d.className = 'bisturi-barra ' + clase; d.hidden = true; for (const n of nodosB) if (n) d.append(n); caja.append(d); ['pointerdown', 'pointerup', 'pointermove'].forEach(t => d.addEventListener(t, e => e.stopPropagation())); return d; };
   const barraPlano = barra('abajo', [$('bisturiPlanoInfo'), $('bisturiCortar'), $('bisturiBorrar')]);
-  const barraLibre = barra('abajo', [$('bisturiLibreInfo'), $('bisturiCerrar'), $('bisturiQuitarPunto'), $('bisturiBorrarPuntos')]);
+  $('bisturiCerrar').textContent = 'Cerrar contorno';
+  const barraLibre = barra('abajo', [$('bisturiLibreInfo'), $('bisturiCerrar'), $('bisturiQuitarPunto'), $('bisturiBorrarPuntos'), bAnadir, bQuitar, bBorrarZona, bCortarZona, bMas]);
   const barraMedidas = barra('arriba', [$('bisturiProfundidad')?.closest('label'), $('bisturiHolgura')?.closest('label')]);
   [...barraPlano.querySelectorAll('button'), ...barraLibre.querySelectorAll('button')].forEach(b => b.classList.remove('full'));
   const barraLibreQ = () => barraLibre;
@@ -320,15 +473,16 @@ export function setupBisturi(ctx) {
   function activar(m) {
     if (modo === m) return;
     if (modo === 'plano' && m !== 'plano') borrarPlanos();
-    if (modo === 'libre' && m !== 'libre') { nodos.length = 0; quitarDeteccion(); }
+    if (modo === 'libre' && m !== 'libre') { nodos.length = 0; quitarDeteccion(); borrarZona(); ctx.soltarVista(vistaLibre); }
     modo = m; trazo = null; limpiarCapa();
+    if (m === 'plano') ctx.registrarVista(vista); else ctx.soltarVista(vista);
     chip.hidden = !m;
     barraPlano.hidden = m !== 'plano'; barraLibreQ().hidden = barraMedidas.hidden = m !== 'libre';
     chip.textContent = m === 'plano' ? '✕ Salir del bisturí' : '✕ Salir del bisturí libre';
     lienzo.style.cursor = m ? 'crosshair' : '';
     if (!m) limpiarCapa();
     if (m === 'plano') { infoPlanos(); ctx.status('Bisturí: dibuja una línea cruzando la figura para crear un plano de corte.'); }
-    if (m === 'libre') { infoNodos(); ctx.status('Bisturí libre: toca alrededor de la zona para poner puntos y cierra tocando el primero.'); }
+    if (m === 'libre') { ctx.registrarVista(vistaLibre); infoNodos(); ctx.status('Bisturí libre: toca alrededor de la zona para poner puntos y cierra tocando el primero.'); if (!zonaDesdePincel()) actualizarBarraLibre(); }
   }
   window.addEventListener('cajon-abierto', e => activar(e.detail === 'bisturi' ? 'plano' : e.detail === 'bisturiLibre' ? 'libre' : null));
   for (const id of ['vSeleccionar', 'vMover', 'vRotar', 'vEscalar', 'vCortePlano']) $(id)?.addEventListener('click', () => { if (modo) salir(); });

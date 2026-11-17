@@ -30,7 +30,7 @@ export function setupCortePlano(ctx) {
     plano.add(borde); plano.renderOrder = 15; plano.position.copy(c); plano.scale.set(lado, lado, 1);
     scene.add(plano);
     gizmo = new TransformControls(camera, renderer.domElement);
-    gizmo.addEventListener('dragging-changed', e => { orbit.enabled = !e.value; });
+    gizmo.addEventListener('dragging-changed', e => { orbit.enabled = !e.value; if (e.value) ctx.cerrarVista(false); else if (activo) ctx.abrirVista(); });
     gizmo.addEventListener('objectChange', () => { plano.scale.z = 1; });
     gizmo.setMode('translate');
     scene.add(gizmo.getHelper()); gizmo.attach(plano);
@@ -50,10 +50,29 @@ export function setupCortePlano(ctx) {
     plano.quaternion.copy(q);
     ejes.querySelectorAll('button').forEach(b => b.classList.toggle('activo', b.dataset.eje === a));
   }
-  ejes.addEventListener('click', e => { const b = e.target.closest('[data-eje]'); if (b) orientar(b.dataset.eje); });
+  ejes.addEventListener('click', e => { const b = e.target.closest('[data-eje]'); if (!b) return; ctx.cerrarVista(false); orientar(b.dataset.eje); ctx.abrirVista(); });
 
+  // Corte que describe el plano tal como está ahora.
+  function corteActual() {
+    plano.updateMatrixWorld(true);
+    const e = plano.matrixWorld.elements, u = new THREE.Vector3(e[0], e[1], e[2]), w = new THREE.Vector3(e[4], e[5], e[6]), normal = new THREE.Vector3(e[8], e[9], e[10]).normalize();
+    const mitad = u.length() / 2, mitadW = w.length() / 2; u.normalize(); w.normalize();
+    const centro = plano.getWorldPosition(new THREE.Vector3());
+    return [{ normal, point: centro, cuadrado: { centro: centro.toArray(), u: u.toArray(), w: w.toArray(), mitad, mitadW } }];
+  }
+  // «Explosión» con el corte por plano activo: vista previa del corte.
+  const vista = ctx.vistaPorCorte(async () => { const r = await ctx.cutWithPlanes(corteActual(), objetivos()); return r.hechos > 0; });
+  // Durante la vista previa el plano se ve muy tenue para no tapar las piezas.
+  const tenue = on => { if (!plano) return; plano.material.opacity = on ? .08 : .32; plano.children[0].material.opacity = on ? .35 : 1; plano.children[0].material.transparent = on; };
+  const vI = vista.iniciar, vT = vista.terminar;
+  let matrizVista = null;
+  vista.iniciar = async () => { plano.updateMatrixWorld(true); matrizVista = plano.matrixWorld.clone(); const ok = await vI(); if (ok) tenue(true); return ok; };
+  vista.terminar = c => { tenue(false); return vT(c); };
   cortar.onclick = async () => {
     if (!plano || ocupado) return;
+    plano.updateMatrixWorld(true);
+    if (ctx.enVista && !(matrizVista && matrizVista.equals(plano.matrixWorld))) ctx.cerrarVista(false);
+    if (ctx.enVista) { ctx.cerrarVista(true); ctx.status('Corte hecho tal como lo viste en la vista previa. «Deshacer» lo devuelve.'); return; }
     if (ctx.busy()) return ctx.status('Vuelve a la vista ensamblada del modelo y desactiva Rayos X.');
     plano.updateMatrixWorld(true);
     const e = plano.matrixWorld.elements, u = new THREE.Vector3(e[0], e[1], e[2]), w = new THREE.Vector3(e[4], e[5], e[6]), normal = new THREE.Vector3(e[8], e[9], e[10]).normalize();
@@ -72,7 +91,7 @@ export function setupCortePlano(ctx) {
     if (on === activo) return;
     if (on && !crearPlano()) return;
     activo = on;
-    if (!on) quitarPlano();
+    if (!on) { ctx.soltarVista(vista); quitarPlano(); } else { ctx.registrarVista(vista); setTimeout(() => { if (activo) ctx.abrirVista(); }, 0); }
     ejes.hidden = cortar.hidden = !on;
     $('vCortePlano')?.classList.toggle('activo', on);
     if (on) ctx.status('Corte por plano: mueve, gira o cambia el tamaño del plano y pulsa «Hacer el corte». Solo se corta la zona que cubre el plano.');

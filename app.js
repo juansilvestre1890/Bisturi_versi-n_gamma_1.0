@@ -25,9 +25,11 @@ import {assertRectangularVolumeChange} from './rectangular-connector.js';
 import {recoverBedLayout,assertBedLayoutRoundTrip} from './bed-project-roundtrip.js';
 import {bedViewTransition,captureBedPlacementState} from './bed-view-switch.js';
 import {sliceMeshByWorldPlane} from './plane-cut.js';
-import {setupCortePlano} from './corte-plano.js?v=20261113b';
-import {setupSeparacionInteligente} from './separacion-inteligente.js?v=20261113b';
-import {setupBisturi} from './bisturi-herramientas.js?v=20261108p';
+import {setupCortePlano} from './corte-plano.js?v=20261113m';
+import {setupSeparacionInteligente} from './separacion-inteligente.js?v=20261117a';
+import {setupBisturiMagnetico} from './bisturi-magnetico.js?v=20261117a';
+import {setupBisturiCurvo} from './bisturi-curvo.js?v=20261117g';
+import {setupBisturi} from './bisturi-herramientas.js?v=20261116c';
 import {repararUnionesT} from './mesh-tjunction.js?v=20261108o';
 import {cruzaCuadrado,pegarFuera} from './plano-finito.js?v=20261108p';
 import {detectarZona} from './bisturi-auto.js?v=20261108o';
@@ -83,6 +85,16 @@ let renderer;try{renderer=new THREE.WebGLRenderer({antialias:true,powerPreferenc
 scene.add(new THREE.HemisphereLight(0xffffff,0x526c94,2.3));const key=new THREE.DirectionalLight(0xffffff,2.5);key.position.set(100,180,130);scene.add(key);
 const grid=new THREE.GridHelper(400,24,0x2384b4,0x284963);scene.add(grid);
 const orbit=new OrbitControls(camera,renderer.domElement);orbit.enableDamping=true;orbit.dampingFactor=.08;
+// Con dos dedos, el zoom solo se activa al abrir o cerrar los dedos (pellizco claro, >12 % de cambio).
+// Si los dedos se mueven juntos, la vista no se acerca ni se aleja por pequeñas variaciones.
+(()=>{const dedos=new Map();let d0=0,zoomListo=true;const caja=renderer.domElement.parentElement||renderer.domElement;
+  const dist=()=>{const p=[...dedos.values()];return Math.hypot(p[0].x-p[1].x,p[0].y-p[1].y)};
+  caja.addEventListener('pointerdown',e=>{if(e.pointerType!=='touch'||e.target!==renderer.domElement)return;dedos.set(e.pointerId,{x:e.pageX,y:e.pageY});
+    if(dedos.size===2){d0=dist();zoomListo=false;orbit.enableZoom=false}},{capture:true,passive:true});
+  caja.addEventListener('pointermove',e=>{if(!dedos.has(e.pointerId))return;dedos.set(e.pointerId,{x:e.pageX,y:e.pageY});
+    if(dedos.size===2&&!zoomListo){const d=dist();if(d0>0&&Math.abs(d/d0-1)>.12){zoomListo=true;orbit._dollyStart?.set(0,d);orbit.enableZoom=true}}},{capture:true,passive:true});
+  const fin=e=>{if(!dedos.delete(e.pointerId))return;if(dedos.size<2){zoomListo=true;orbit.enableZoom=true}};
+  window.addEventListener('pointerup',fin,{capture:true,passive:true});window.addEventListener('pointercancel',fin,{capture:true,passive:true});})();
 const transform=new TransformControls(camera,renderer.domElement);transform.addEventListener('dragging-changed',e=>orbit.enabled=!e.value);scene.add(transform.getHelper());
 // El manipulador se coloca en el centro de la pieza (centro de su caja), no en su origen:
 // se mueve un pivote invisible y la pieza sigue la misma transformación.
@@ -288,11 +300,32 @@ renderer.domElement.addEventListener('pointerdown',e=>{
  if(bedMode||!['Pincel','Varita','Magnético'].includes(tool)||!e.isPrimary)return;
  if(explode||xray)return status('Reúne las piezas y desactiva Rayos X antes de pintar.');
  if(e.pointerType==='touch'&&e.width>45)return;const hit=surfaceRaycast(e);if(!hit)return;
- e.preventDefault();e.stopImmediatePropagation();surfaceDrag={id:e.pointerId,x:e.clientX,y:e.clientY,stroke:{saved:false}};
+ e.preventDefault();e.stopImmediatePropagation();
+ // Dos toques seguidos con el pincel sobre lo seleccionado: se deselecciona toda esa zona.
+ const ahora=e.timeStamp;
+ if(tool==='Pincel'&&ultimoToquePincel&&ahora-ultimoToquePincel.t<450&&Math.hypot(e.clientX-ultimoToquePincel.x,e.clientY-ultimoToquePincel.y)<30&&ultimoToquePincel.mesh===hit.object){
+  const prev=ultimoToquePincel;ultimoToquePincel=null;surfaceSelector.cancel();
+  surfaceSelections.set(prev.mesh.uuid,new Set(prev.antes));
+  if(prev.antes.has(hit.faceIndex))quitarZonaSeleccion(prev.mesh,hit.faceIndex);
+  updateSurfaceOverlay(prev.mesh);updateSurfaceInfo?.();dirty=true;return;
+ }
+ surfaceDrag={id:e.pointerId,x:e.clientX,y:e.clientY,x0:e.clientX,y0:e.clientY,t0:ahora,mesh:hit.object,antes:new Set(surfaceSet(hit.object)),stroke:{saved:false}};
  orbit.enabled=false;renderer.domElement.setPointerCapture(e.pointerId);surfacePaint(e,hit);
 },true);
 renderer.domElement.addEventListener('pointermove',e=>{if(!surfaceDrag||surfaceDrag.id!==e.pointerId)return;e.preventDefault();e.stopImmediatePropagation();if(tool==='Pincel'&&Math.hypot(e.clientX-surfaceDrag.x,e.clientY-surfaceDrag.y)>5){surfaceDrag.x=e.clientX;surfaceDrag.y=e.clientY;surfacePaint(e)}},true);
-function stopSurfaceStroke(e){if(!surfaceDrag||surfaceDrag.id!==e.pointerId)return;e.preventDefault();e.stopImmediatePropagation();try{renderer.domElement.releasePointerCapture(e.pointerId)}catch(_){}surfaceDrag=null;orbit.enabled=true;}
+let ultimoToquePincel=null;
+// Quita de la selección la zona conectada (por aristas) que contiene la cara tocada.
+function quitarZonaSeleccion(mesh,f0){
+ const sel=surfaceSet(mesh),g=mesh.geometry,P=g.attributes.position,I=g.index,v=(f,k)=>I?I.getX(3*f+k):3*f+k;
+ const clave=i=>Math.round(P.getX(i)*1e4)+','+Math.round(P.getY(i)*1e4)+','+Math.round(P.getZ(i)*1e4);
+ const porArista=new Map();
+ for(const f of sel)for(let k=0;k<3;k++){const a=clave(v(f,k)),b=clave(v(f,(k+1)%3)),e=a<b?a+'|'+b:b+'|'+a;let l=porArista.get(e);if(!l)porArista.set(e,l=[]);l.push(f)}
+ const zona=[f0],vista=new Set([f0]);
+ for(let i=0;i<zona.length;i++){const f=zona[i];for(let k=0;k<3;k++){const a=clave(v(f,k)),b=clave(v(f,(k+1)%3)),e=a<b?a+'|'+b:b+'|'+a;for(const F of porArista.get(e)||[])if(!vista.has(F)){vista.add(F);zona.push(F)}}}
+ for(const f of zona)sel.delete(f);
+ status(`Zona deseleccionada (${zona.length} caras).`);
+}
+function stopSurfaceStroke(e){if(!surfaceDrag||surfaceDrag.id!==e.pointerId)return;if(tool==='Pincel'&&Math.hypot(e.clientX-surfaceDrag.x0,e.clientY-surfaceDrag.y0)<8&&e.timeStamp-surfaceDrag.t0<500)ultimoToquePincel={t:e.timeStamp,x:e.clientX,y:e.clientY,mesh:surfaceDrag.mesh,antes:surfaceDrag.antes};else ultimoToquePincel=null;e.preventDefault();e.stopImmediatePropagation();try{renderer.domElement.releasePointerCapture(e.pointerId)}catch(_){}surfaceDrag=null;orbit.enabled=true;}
 renderer.domElement.addEventListener('pointerup',stopSurfaceStroke,true);renderer.domElement.addEventListener('pointercancel',e=>{if(surfaceDrag?.id===e.pointerId){stopSurfaceStroke(e);surfaceSelector.cancel();status('Trazo interrumpido; se conserva lo marcado. Usa «Deshacer» para revertirlo.')}},true);
 function setSurfaceTool(t){if(surfacePreview)clearSurfacePreview();if(touchPlaneActive){touchPlaneActive=false;planeDrag=null;syncPlaneTouchUI();setGuide(false);}if(pegTouchActive)disablePegTouch();setTool(t);$('brushTool').classList.toggle('active',t==='Pincel');$('wandTool').classList.toggle('active',t==='Varita');$('magneticTool').classList.toggle('active',t==='Magnético');status(t==='Pincel'?'Pincel activo: toca o arrastra sobre la malla.':t==='Varita'?'Varita activa: toca una región de color.':'Magnético activo: toca una región; la selección seguirá bordes de forma y color.')}
 $('brushTool').onclick=()=>setSurfaceTool('Pincel');$('wandTool').onclick=()=>setSurfaceTool('Varita');$('magneticTool').onclick=()=>setSurfaceTool('Magnético');
@@ -579,8 +612,8 @@ function snapshot(){return {items:meshes.map(m=>({m,g:m.geometry,parent:m.parent
 function save(){undo.push(snapshot());if(undo.length>50)undo.shift();redo=[];dirty=true}
 function applyVisualState(){meshes.forEach(m=>{const mats=Array.isArray(m.material)?m.material:[m.material];mats.forEach(mat=>{if(!mat)return;mat.transparent=xray;mat.opacity=xray?.35:1;mat.depthWrite=!xray;mat.needsUpdate=true})});$('xrayBtn').classList.toggle('active',xray);$('explodeBtn').classList.toggle('active',explode)}
 function restore(s){clearSurfaceOverlays();disablePegTouch();pegCustomOffsets=null;pegAutoInfo=null;clearPegMarkers();touchPlaneActive=false;syncPlaneTouchUI();setGuide(false);cutPair=null;syncResultButtons();(transform.detach(),gizmoTarget=null);const desired=new Set(s.items.map(v=>v.m));for(const m of meshes)if(!desired.has(m))m.removeFromParent();meshes=s.items.map(v=>v.m);for(const v of s.items){if(v.m.parent!==v.parent)v.parent.add(v.m);v.m.geometry=v.g;v.m.position.fromArray(v.p);v.m.rotation.set(...v.r);v.m.scale.fromArray(v.s);v.m.visible=v.visible!==false}root.position.fromArray(s.rootPosition||[0,0,0]);root.scale.fromArray(s.rootScale||[1,1,1]);root.quaternion.fromArray(s.rootQuaternion||[0,0,0,1]);explode=!!s.explode;xray=!!s.xray;explodeOrigins=new Map((s.explodeOrigins||[]).map(([id,v])=>[id,new THREE.Vector3().fromArray(v)]));beds=s.beds.map(b=>({...b,items:[...b.items],placements:structuredClone(b.placements)}));nextBedId=s.nextBedId||Math.max(...beds.map(b=>b.id),0)+1;activeBed=beds.some(b=>b.id===s.activeBed)?s.activeBed:beds[0].id;selected=meshes.find(m=>m.uuid===s.selected)||null;modelLoaded=meshes.length>0;for(const [id,faces] of (s.surfaces||[])){const mesh=meshes.find(m=>m.uuid===id);if(mesh){surfaceSelections.set(id,new Set(faces));updateSurfaceOverlay(mesh)}}for(const [id,face] of (s.surfaceTouches||[]))if(surfaceSelections.get(id)?.has(face))lastSurfaceTouch.set(id,face);applyVisualState();refreshBeds();updateList();updateStats();if(bedMode)updateBedStage();if(selected&&tool==='Mover'&&!bedMode&&!explode)attachGizmo(selected);syncResultButtons()}
-function undoStep(){if(!undo.length)return;redo.push(snapshot());restore(undo.pop());status('Acción deshecha.')}
-function redoStep(){if(!redo.length)return;undo.push(snapshot());restore(redo.pop());status('Acción rehecha.')}
+function undoStep(){if(vistaActiva){cerrarVista(false);status('Vista previa cerrada; no se cortó nada.');return}if(!undo.length)return;redo.push(snapshot());restore(undo.pop());status('Acción deshecha.')}
+function redoStep(){if(vistaActiva)cerrarVista(false);if(!redo.length)return;undo.push(snapshot());restore(redo.pop());status('Acción rehecha.')}
 function clear(){if($('importDiagnosis'))$('importDiagnosis').textContent='Carga un modelo para comprobar sus mallas.';clearSurfaceOverlays();disablePegTouch();pegCustomOffsets=null;pegAutoInfo=null;clearPegMarkers();touchPlaneActive=false;syncPlaneTouchUI();setGuide(false);cutPair=null;syncResultButtons();leaveBed();(transform.detach(),gizmoTarget=null);root.clear();root.position.set(0,0,0);root.rotation.set(0,0,0);root.scale.set(1,1,1);meshes=[];selected=null;undo=[];redo=[];basePositions.clear();explodeOrigins.clear();originalMaterials.clear();modelLoaded=false;dirty=false;explode=false;xray=false;applyVisualState();updateList();updateStats();resetBeds()}
 function prepare(object,name){clear();root.add(object);root.updateMatrixWorld(true);object.traverse(child=>{if(!child.isMesh)return;if(!child.geometry?.attributes?.position)return;const mat=child.material;if(Array.isArray(mat))child.material=mat.map(m=>m.clone());else child.material=mat?.clone()||new THREE.MeshStandardMaterial({color:0x4da7eb});child.name=child.name||`Pieza ${meshes.length+1}`;meshes.push(child);originalMaterials.set(child.uuid,child.material);basePositions.set(child.uuid,child.position.clone());});modelLoaded=meshes.length>0;loadRaycastAcceleration().then(ok=>{if(ok&&modelLoaded)accelerateSurfaceMeshes(meshes)});$('projectName').value=name;fit();updateList();updateStats();refreshBeds();status(`${meshes.length} objeto(s) de malla cargado(s). Se pueden inspeccionar aunque tengan defectos.`);dirty=true;diagnoseAfterImport()}
 let bvhTimer=0;function scheduleAcceleration(){clearTimeout(bvhTimer);bvhTimer=setTimeout(()=>loadRaycastAcceleration().then(ok=>{if(ok&&modelLoaded)accelerateSurfaceMeshes(meshes)}),400);}
@@ -715,6 +748,85 @@ function sceneTriangles(){let n=0;for(const m of meshes){const g=m.geometry;n+=(
 function interactionStart(){clearTimeout(lowResTimer);const n=sceneTriangles();if(n<150000)return;const low=n>1500000?.6:n>600000?.8:1;if(renderer.getPixelRatio()!==low){renderer.setPixelRatio(low);resize();}}
 function interactionEnd(){clearTimeout(lowResTimer);lowResTimer=setTimeout(()=>{if(renderer.getPixelRatio()!==fullPixelRatio){renderer.setPixelRatio(fullPixelRatio);resize();}},250);}
 orbit.addEventListener('start',interactionStart);orbit.addEventListener('end',interactionEnd);
+// Navegación (girar, desplazar o acercar la cámara): la interfaz muestra el icono de navegar junto al puntero.
+orbit.addEventListener('start',()=>window.dispatchEvent(new CustomEvent('bisturi-navegar',{detail:true})));orbit.addEventListener('end',()=>window.dispatchEvent(new CustomEvent('bisturi-navegar',{detail:false})));
+// Indicador 3D de navegación: dos aros con flechas (rojo horizontal, verde vertical) donde está el puntero.
+// Está fijo en el mundo, así que al girar la vista se ve girar en 3D; siempre del mismo tamaño en pantalla.
+const gizmoNav=(()=>{
+  const g=new THREE.Group();g.visible=false;
+  const mat=c=>new THREE.MeshPhysicalMaterial({color:c,emissive:c,emissiveIntensity:.18,roughness:.12,metalness:0,clearcoat:1,clearcoatRoughness:.1,transparent:true,opacity:0,side:THREE.DoubleSide,depthTest:false,depthWrite:false});
+  // Aro como cinta plana (sección rectangular): tramo de corona extruido a lo largo del eje del aro.
+  const R=1,grueso=.07,ancho=.2;
+  const tramo=(a0,a1,m)=>{const sh=new THREE.Shape(),n=40,ro=R+grueso/2,ri=R-grueso/2;
+    for(let i=0;i<=n;i++){const a=a0+(a1-a0)*i/n;i?sh.lineTo(ro*Math.cos(a),ro*Math.sin(a)):sh.moveTo(ro*Math.cos(a),ro*Math.sin(a))}
+    for(let i=n;i>=0;i--){const a=a0+(a1-a0)*i/n;sh.lineTo(ri*Math.cos(a),ri*Math.sin(a))}
+    const geo=new THREE.ExtrudeGeometry(sh,{depth:ancho,bevelEnabled:false,curveSegments:40});geo.translate(0,0,-ancho/2);return new THREE.Mesh(geo,m)};
+  // Punta de flecha plana, en la misma superficie de la cinta, apuntando en el sentido del giro.
+  const punta=(a,m)=>{const nr=new THREE.Vector3(Math.cos(a),Math.sin(a),0),t=new THREE.Vector3(-Math.sin(a),Math.cos(a),0),Z=new THREE.Vector3(0,0,1),L=.36,hw=ancho*1.25;
+    const V=(sx,z,r)=>nr.clone().multiplyScalar(r).addScaledVector(t,sx).addScaledVector(Z,z);
+    const P=[V(0,-hw,R-grueso/2),V(0,hw,R-grueso/2),V(L,0,R-grueso/2),V(0,-hw,R+grueso/2),V(0,hw,R+grueso/2),V(L,0,R+grueso/2)];
+    const geo=new THREE.BufferGeometry().setFromPoints(P);geo.setIndex([0,1,2,3,5,4,0,3,4,0,4,1,1,4,5,1,5,2,2,5,3,2,3,0]);geo.computeVertexNormals();return new THREE.Mesh(geo,m)};
+  // Cada aro: dos tramos con su flecha al final (mismo sentido de giro), con huecos entre ellos.
+  const aro=c=>{const a=new THREE.Group(),m=mat(c),d=THREE.MathUtils.degToRad;
+    for(const [i0,i1] of [[d(25),d(160)],[d(205),d(340)]]){a.add(tramo(i0,i1,m));a.add(punta(i1,m))}
+    a.traverse(o=>{o.renderOrder=999;o.raycast=()=>{}});return a};
+  const rojo=aro(0xff3341);rojo.rotation.x=Math.PI/2;           // horizontal
+  const verde=aro(0x29c95c);verde.rotation.y=Math.PI/2;verde.scale.setScalar(.92); // vertical
+  const rojoG=new THREE.Group();rojoG.add(rojo);rojoG.rotation.y=THREE.MathUtils.degToRad(30); // huecos y flechas rojas a los lados
+  g.add(rojoG,verde);scene.add(g);
+  // Sigue al puntero: se coloca donde está el ratón o el dedo, a la profundidad del centro de giro.
+  const ptr={x:null,y:null},rc=new THREE.Raycaster(),ndc=new THREE.Vector2(),plano=new THREE.Plane(),enPunto=new THREE.Vector3(),dirCam=new THREE.Vector3();
+  // Con dos dedos el indicador va en el punto medio entre los dedos.
+  const toques=new Map();
+  for(const t of ['pointerup','pointercancel'])window.addEventListener(t,e=>toques.delete(e.pointerId),{capture:true,passive:true});
+  const seguir=e=>{const r=renderer.domElement.getBoundingClientRect();
+    if(e.pointerType==='touch'){toques.set(e.pointerId,{x:e.clientX-r.left,y:e.clientY-r.top});const p=[...toques.values()];ptr.x=p.reduce((a,q)=>a+q.x,0)/p.length;ptr.y=p.reduce((a,q)=>a+q.y,0)/p.length;return}
+    ptr.x=e.clientX-r.left;ptr.y=e.clientY-r.top};
+  for(const t of ['pointerdown','pointermove'])renderer.domElement.addEventListener(t,seguir,{capture:true,passive:true});
+  const donde=()=>{
+    if(ptr.x==null)return orbit.target;
+    const r=renderer.domElement.getBoundingClientRect();ndc.set(ptr.x/r.width*2-1,-(ptr.y/r.height)*2+1);rc.setFromCamera(ndc,camera);
+    camera.getWorldDirection(dirCam);plano.setFromNormalAndCoplanarPoint(dirCam,orbit.target);
+    return rc.ray.intersectPlane(plano,enPunto)||orbit.target};
+  // ---- Qué está haciendo la cámara: girar, mover (desplazar) o zoom ----
+  // Se decide por el movimiento real de la cámara en cada fotograma (no por los dedos), con memoria:
+  // el modo elegido solo cambia si otro movimiento domina con claridad. Así no salta de un icono a otro.
+  let activo=false,gracia=0,prev=null,modo=null,signo=0;const sc={girar:0,mover:0,zoom:0};
+  const foto=()=>({dir:camera.position.clone().sub(orbit.target).normalize(),dist:camera.position.distanceTo(orbit.target),target:orbit.target.clone()});
+  const avisar=()=>window.dispatchEvent(new CustomEvent('bisturi-nav-modo',{detail:{modo,signo}}));
+  orbit.addEventListener('start',()=>{if(!activo&&performance.now()>gracia){prev=foto();sc.girar=sc.mover=sc.zoom=0;if(modo){modo=null;avisar()}}activo=true});
+  orbit.addEventListener('end',()=>{activo=false;gracia=performance.now()+320});
+  function clasificar(){
+    const vivo=activo||performance.now()<gracia;
+    if(!vivo){if(modo){modo=null;signo=0;avisar()}return}
+    if(!prev){prev=foto();return}
+    const c=foto();
+    const dr=Math.acos(Math.min(1,Math.max(-1,c.dir.dot(prev.dir)))),dz=Math.log(c.dist/prev.dist),dp=c.target.distanceTo(prev.target)/Math.max(1e-6,c.dist);
+    sc.girar=sc.girar*.8+dr;sc.zoom=sc.zoom*.8+Math.abs(dz);sc.mover=sc.mover*.8+dp*1.5;
+    let mejor='girar';for(const k of ['zoom','mover'])if(sc[k]>sc[mejor])mejor=k;
+    let cambio=false;
+    if(sc[mejor]>.006){
+      // El icono se decide con el primer movimiento y ya no cambia hasta soltar (aunque luego se haga otro).
+      if(!modo){modo=mejor;cambio=true}
+    }
+    if(modo==='zoom'&&Math.abs(dz)>1e-4){const s2=dz<0?1:-1;if(s2!==signo){signo=s2;cambio=true}}
+    if(cambio){
+      if(modo==='girar'&&opacidad<.05){const v=camera.position.clone().sub(orbit.target);g.rotation.set(0,Math.atan2(v.x,v.z)-THREE.MathUtils.degToRad(28),0)}
+      avisar()}
+    prev=c;
+  }
+  let opacidad=0;
+  return {actualizar(){
+    clasificar();
+    // Los aros 3D solo salen al GIRAR la vista (mover = mano, zoom = lupa).
+    const meta=modo==='girar'?1:0;opacidad+=(meta-opacidad)*.25;if(Math.abs(meta-opacidad)<.01)opacidad=meta;
+    g.visible=opacidad>.01;if(!g.visible)return;
+    g.position.copy(donde());
+    const d=camera.position.distanceTo(g.position),h=renderer.domElement.clientHeight||600;
+    g.scale.setScalar(d*Math.tan(THREE.MathUtils.degToRad(camera.fov/2))*2*(32/h)); // ~32 px de radio
+    g.traverse(o=>{if(o.material)o.material.opacity=.82*opacidad});
+  }};
+})();
 transform.addEventListener('dragging-changed',e=>e.value?interactionStart():interactionEnd());
 $('xrayBtn').onclick=()=>{if(!modelLoaded)return;save();xray=!xray;applyVisualState();dirty=true};
 // Explosión gradual (como la primera versión): cada pieza se aleja del centro del modelo en su
@@ -864,7 +976,7 @@ function syncConnectorShape(){
   const dv=$('pegShape').value==='dovetail',lw=$('rectWidth').closest('label'),lh=$('rectHeight').closest('label');
   if(dv&&$('rectWidth').value==='5'&&$('rectHeight').value==='4'){$('rectWidth').value='8';$('rectHeight').value='10';$('dovetailTaper').value='1.5';}
   lw.firstChild.textContent=dv?'Ancho máximo del riel (mm)':'Ancho rectangular (mm)';lh.firstChild.textContent=dv?'Largo del riel (mm)':'Alto rectangular (mm)';
-  $('pegCount').closest('label').firstChild.textContent=dv?'Cantidad de rieles':'Cantidad de pasadores';
+  $('pegCount').closest('label').firstChild.textContent='Cantidad';
   pegCustomOffsets=null;pegAutoInfo=null;disablePegTouch();clearPegMarkers();
   $('pegPreviewInfo').textContent='Elige Ver ubicación de pasadores para revisar la geometría.';
 }
@@ -944,12 +1056,102 @@ function runV2f(pair,c,{soloUbicar=false,evitar=null}={}){
   return {r,M,pieces,J,m,mate};
 }
 function selectedCutPair(){
-  const m=selected,info=m?.userData?.bisturiCut;
-  if(!info)throw Error('Selecciona una mitad resultante de un corte.');
-  const mate=meshes.find(p=>p.uuid===info.mate);
-  if(!mate||mate.userData?.bisturiCut?.mate!==m.uuid)throw Error('No se encuentra la otra mitad del corte.');
-  if(conEncastre(m)||conEncastre(mate))throw Error('Esta unión ya tiene encastres. Usa «Quitar encastre» para cambiarlos.');
-  return {m,mate,info};
+  const valido=x=>meshes.includes(x)&&x.visible!==false&&!x.userData.bisturiAlignmentPin;
+  const pareja=x=>{const i=x?.userData?.bisturiCut;if(!i)return null;const o=meshes.find(q=>q.uuid===i.mate);return o&&o.userData?.bisturiCut?.mate===x.uuid?o:null};
+  let m=valido(selected)?selected:null;
+  // 1) Unión de un corte recto (plano o Bisturí) que aún no tiene encastre.
+  if(m){const o=pareja(m);if(o&&!encastreEntre(m,o))return {m,mate:o,info:m.userData.bisturiCut}}
+  else{
+    const libres=meshes.filter(x=>valido(x)&&pareja(x)&&!encastreEntre(x,pareja(x)));
+    if(libres.length){m=libres[libres.length-1];selected=m;updateList();return {m,mate:pareja(m),info:m.userData.bisturiCut}}
+  }
+  // 2) Cualquier otra unión entre dos piezas que comparten la cara del corte.
+  const uniones=buscarUniones(m?[m]:meshes.filter(valido)).filter(u=>!encastreEntre(u.a,u.b));
+  if(!uniones.length)throw Error(m?`«${m.name}» no comparte una cara de corte libre con otra pieza (o ya tiene encastre en todas).`:'No hay piezas cortadas que compartan una cara de corte. Corta la figura primero.');
+  const u=uniones[0];
+  if(u.plana){
+    // Cara plana: se usa el motor de encastres de siempre (todos los tipos).
+    const P=u.a,N=u.b;
+    P.userData.bisturiCut={...u.info,mate:N.uuid,side:'positive'};N.userData.bisturiCut={...u.info,mate:P.uuid,side:'negative'};
+    if(selected!==P){selected=P;updateList()}
+    return {m:P,mate:N,info:P.userData.bisturiCut};
+  }
+  if(selected!==u.a){selected=u.a;updateList()}
+  return {m:u.a,mate:u.b,curva:u};
+}
+// Uniones: pares de piezas que comparten triángulos (la misma tapa del corte, vista desde cada lado).
+// Se comparan en coordenadas locales: las piezas de un mismo modelo comparten marco aunque se muevan.
+function buscarUniones(lista){
+  const clave=(P,a,b,c)=>{const k=v=>Math.round(P[3*v]*1000)+','+Math.round(P[3*v+1]*1000)+','+Math.round(P[3*v+2]*1000);return [k(a),k(b),k(c)].sort().join('|')};
+  const datos=new Map();
+  const de=x=>{let d=datos.get(x);if(d)return d;const g=x.geometry,p=g.attributes.position.array,I=g.index?g.index.array:null,n=(I?I.length:p.length/3)/3,tri=I||Uint32Array.from({length:n*3},(_,i)=>i);
+    const mapa=new Map();for(let f=0;f<n;f++)mapa.set(clave(p,tri[3*f],tri[3*f+1],tri[3*f+2]),f);d={p,tri,n,mapa};datos.set(x,d);return d};
+  const todos=meshes.filter(x=>x.visible!==false&&!x.userData.bisturiAlignmentPin),vistos=new Set(),res=[];
+  for(const a of lista)for(const b of todos){
+    if(a===b||a.parent!==b.parent)continue;const k=[a.uuid,b.uuid].sort().join();if(vistos.has(k))continue;vistos.add(k);
+    const A=de(a),B=de(b);if(A.n>B.n*40&&B.n>2000)continue;
+    const caras=[];for(const [key,f] of B.mapa)if(A.mapa.has(key))caras.push(A.mapa.get(key));
+    let u=null;
+    if(caras.length>=3)u=analizarUnion(a,b,A,caras);
+    else u=unionPorContacto(a,b,A,B); // piezas sueltas que se apoyan una en otra por una cara plana
+    if(u){u.vol=Math.min(volumenDe(A),volumenDe(B));res.push(u)}
+  }
+  // Primero las uniones entre las piezas más grandes.
+  return res.sort((x,y)=>y.vol-x.vol||y.area-x.area);
+}
+function volumenDe(D){if(D.vol!==undefined)return D.vol;const P=D.p,T=D.tri;let v=0;for(let f=0;f<D.n;f++){const i=3*T[3*f],j=3*T[3*f+1],k=3*T[3*f+2];v+=P[i]*(P[j+1]*P[k+2]-P[j+2]*P[k+1])-P[i+1]*(P[j]*P[k+2]-P[j+2]*P[k])+P[i+2]*(P[j]*P[k+1]-P[j+1]*P[k])}return D.vol=Math.abs(v)/6}
+// Caras planas de una pieza agrupadas por plano (normal y distancia redondeadas).
+function planosDe(D){
+  if(D.planos)return D.planos;const P=D.p,T=D.tri,m=new Map();
+  for(let f=0;f<D.n;f++){const i=3*T[3*f],j=3*T[3*f+1],k=3*T[3*f+2];
+    const ux=P[j]-P[i],uy=P[j+1]-P[i+1],uz=P[j+2]-P[i+2],vx=P[k]-P[i],vy=P[k+1]-P[i+1],vz=P[k+2]-P[i+2];
+    let nx=uy*vz-uz*vy,ny=uz*vx-ux*vz,nz=ux*vy-uy*vx;const l=Math.hypot(nx,ny,nz);if(l<1e-9)continue;nx/=l;ny/=l;nz/=l;
+    const d=nx*P[i]+ny*P[i+1]+nz*P[i+2],key=Math.round(nx*500)+','+Math.round(ny*500)+','+Math.round(nz*500)+','+Math.round(d*50);
+    let g=m.get(key);if(!g)m.set(key,g={n:[nx,ny,nz],d,area:0,c:[0,0,0],caras:[]});
+    const ar=l/2;g.area+=ar;g.c[0]+=ar*(P[i]+P[j]+P[k])/3;g.c[1]+=ar*(P[i+1]+P[j+1]+P[k+1])/3;g.c[2]+=ar*(P[i+2]+P[j+2]+P[k+2])/3;g.caras.push(f)}
+  for(const g of m.values()){g.c=g.c.map(x=>x/g.area)}
+  return D.planos=m;
+}
+function unionPorContacto(a,b,A,B){
+  const bbA=new THREE.Box3().setFromBufferAttribute(a.geometry.attributes.position),bbB=new THREE.Box3().setFromBufferAttribute(b.geometry.attributes.position);
+  if(!bbA.clone().expandByScalar(0.05).intersectsBox(bbB))return null;
+  const pA=planosDe(A),pB=planosDe(B);let mejor=null;
+  const dentro=(D,g,c)=>{const P=D.p,T=D.tri;for(const f of g.caras){const i=3*T[3*f],j=3*T[3*f+1],k=3*T[3*f+2];
+      // punto en triángulo (baricéntricas, en 3D sobre el plano)
+      const v0=[P[j]-P[i],P[j+1]-P[i+1],P[j+2]-P[i+2]],v1=[P[k]-P[i],P[k+1]-P[i+1],P[k+2]-P[i+2]],v2=[c[0]-P[i],c[1]-P[i+1],c[2]-P[i+2]];
+      const d00=v0[0]*v0[0]+v0[1]*v0[1]+v0[2]*v0[2],d01=v0[0]*v1[0]+v0[1]*v1[1]+v0[2]*v1[2],d11=v1[0]*v1[0]+v1[1]*v1[1]+v1[2]*v1[2],d20=v2[0]*v0[0]+v2[1]*v0[1]+v2[2]*v0[2],d21=v2[0]*v1[0]+v2[1]*v1[1]+v2[2]*v1[2],den=d00*d11-d01*d01;if(Math.abs(den)<1e-12)continue;
+      const v=(d11*d20-d01*d21)/den,w=(d00*d21-d01*d20)/den;if(v>=-1e-6&&w>=-1e-6&&v+w<=1+1e-6)return true}return false};
+  for(const g of pA.values()){
+    if(g.area<4)continue;
+    for(const h of pB.values()){
+      if(h.area<4)continue;
+      if(g.n[0]*h.n[0]+g.n[1]*h.n[1]+g.n[2]*h.n[2]>-0.9999||Math.abs(g.d+h.d)>0.03)continue; // caras enfrentadas en el mismo plano
+      const chica=g.area<=h.area?g:h,enA=chica===g;
+      if(!dentro(enA?B:A,enA?h:g,chica.c))continue;
+      if(!mejor||chica.area>mejor.area)mejor={area:chica.area,c:chica.c,nA:g.n};
+    }
+  }
+  if(!mejor)return null;
+  a.updateWorldMatrix(true,false);const M=a.matrixWorld,inv=M.clone().invert();
+  const cL=new THREE.Vector3(...mejor.c),nL=new THREE.Vector3(...mejor.nA),NW=nL.clone().transformDirection(M).negate();
+  const info={point:cL.clone().applyMatrix4(M).toArray(),normal:NW.toArray(),maxRadius:Math.sqrt(mejor.area/Math.PI),localPoint:cL.toArray(),localNormal:nL.clone().negate().toArray()};
+  return {a,b,caras:[],area:mejor.area,plana:true,info,datos:A};
+}
+function analizarUnion(a,b,A,caras){
+  const P=A.p,T=A.tri;let area=0,nx=0,ny=0,nz=0,cx=0,cy=0,cz=0;
+  for(const f of caras){const i=3*T[3*f],j=3*T[3*f+1],k=3*T[3*f+2];
+    const ux=P[j]-P[i],uy=P[j+1]-P[i+1],uz=P[j+2]-P[i+2],vx=P[k]-P[i],vy=P[k+1]-P[i+1],vz=P[k+2]-P[i+2];
+    const qx=uy*vz-uz*vy,qy=uz*vx-ux*vz,qz=ux*vy-uy*vx,ar=Math.hypot(qx,qy,qz)/2;
+    area+=ar;nx+=qx/2;ny+=qy/2;nz+=qz/2;cx+=ar*(P[i]+P[j]+P[k])/3;cy+=ar*(P[i+1]+P[j+1]+P[k+1])/3;cz+=ar*(P[i+2]+P[j+2]+P[k+2])/3}
+  if(area<=0)return null;
+  const ln=Math.hypot(nx,ny,nz)||1;nx/=ln;ny/=ln;nz/=ln;cx/=area;cy/=area;cz/=area;
+  let dev=0,span=0;for(const f of caras)for(let q=0;q<3;q++){const v=3*T[3*f+q],d=(P[v]-cx)*nx+(P[v+1]-cy)*ny+(P[v+2]-cz)*nz;dev=Math.max(dev,Math.abs(d));span=Math.max(span,Math.hypot(P[v]-cx,P[v+1]-cy,P[v+2]-cz))}
+  const plana=dev<=Math.max(1e-3,span*2e-6);
+  // Normal de la tapa de «a»: sale de «a» hacia «b». En un corte recto, la mitad positiva tiene la tapa mirando a −N.
+  a.updateWorldMatrix(true,false);const M=a.matrixWorld,inv=M.clone().invert();
+  const cL=new THREE.Vector3(cx,cy,cz),nL=new THREE.Vector3(nx,ny,nz),cW=cL.clone().applyMatrix4(M),NW=nL.clone().transformDirection(M).negate();
+  const info={point:cW.toArray(),normal:NW.toArray(),maxRadius:Math.sqrt(area/Math.PI),localPoint:cL.toArray(),localNormal:nL.clone().negate().toArray()};
+  return {a,b,caras,area,plana,info,datos:A};
 }
 $('pegPreviewBtn').onclick=()=>{
   clearPegMarkers();
@@ -1109,13 +1311,19 @@ function connectorShapesFor(info,src,half,centersWorld,c,role){
 // pieza se unió y qué pasadores sueltos se crearon. Sirve aunque se hayan hecho otras cosas después.
 const antesEncastre=new WeakMap();
 function heredarEncastre(old,nueva){const e=antesEncastre.get(old);antesEncastre.set(nueva,{geo:e?e.geo:old.geometry,enlaces:e?[...e.enlaces]:[]})}
-function enlazarEncastre(a,b,pines){antesEncastre.get(a)?.enlaces.push({mate:b,pines});antesEncastre.get(b)?.enlaces.push({mate:a,pines})}
+function idPieza(m){return m.userData.idPieza||(m.userData.idPieza=THREE.MathUtils.generateUUID())}
+function enlazarEncastre(a,b,pines){antesEncastre.get(a)?.enlaces.push({mate:b,mateId:idPieza(b),pines});antesEncastre.get(b)?.enlaces.push({mate:a,mateId:idPieza(a),pines})}
+// ¿Ya hay encastre entre estas dos piezas? (una pieza puede tener encastres con varias vecinas)
+function encastreEntre(a,b){
+  for(const [x,y] of [[a,b],[b,a]]){const e=antesEncastre.get(x);if(!e||!conEncastre(x))continue;const id=idPieza(y);if(e.enlaces.some(l=>l.mateId===id||l.mate===y))return true}
+  return false;
+}
 function conEncastre(m){const e=antesEncastre.get(m);return e?m.geometry!==e.geo||e.enlaces.some(l=>l.pines.some(p=>meshes.includes(p))):!!m.userData.bisturiCut?.connectorMade}
 function quitarEncastre(){
   if(bedMode||explode||xray)return status('Vuelve a la vista ensamblada y desactiva Rayos X para quitar encastres.');
-  if(!selected||!meshes.includes(selected))return status('Selecciona la pieza a la que quieres quitarle el encastre.');
+  if(!selected||!meshes.includes(selected))return status('No se pudo quitar: selecciona primero la pieza que tiene el encastre.');
   const e=antesEncastre.get(selected);
-  if(!e||!conEncastre(selected))return status(`«${selected.name}» no tiene encastres.`);
+  if(!e||!conEncastre(selected))return status(`No se pudo quitar: «${selected.name}» no tiene encastres.`);
   save();(transform.detach(),gizmoTarget=null);
   const piezas=new Set([selected]),pines=new Set();
   for(const l of e.enlaces){if(meshes.includes(l.mate))piezas.add(l.mate);l.pines.forEach(p=>pines.add(p))}
@@ -1132,10 +1340,10 @@ function separateForReview(piece,normal,distance){
   piece.parent.updateWorldMatrix(true,false);piece.parent.worldToLocal(p);piece.position.copy(p);
   basePositions.set(piece.uuid,piece.position.clone());piece.updateMatrixWorld(true);
 }
-$('pegApplyBtn').onclick=async()=>{
+async function aplicarEncastreUna(){
   if(bedMode||explode||xray)return status('Vuelve a la vista ensamblada del modelo y desactiva Rayos X.');
   let pair,c,positionInfo;
-  try{pair=selectedCutPair();c=pegConfig();if(!usesV2f(c))positionInfo=pegPositions(pair.info,c)}catch(e){return status(e.message)}
+  try{pair=selectedCutPair();c=pegConfig();if(pair.curva)return encastreCurvo(pair,c);if(!usesV2f(c))positionInfo=pegPositions(pair.info,c)}catch(e){return status(e.message)}
   if(usesV2f(c))return applyV2fConnectors(pair,c);
   if(c.shape==='alignment')return applyLooseAlignmentPins(pair,c,positionInfo);
   const {m,mate,info}=pair,positive=info.side==='positive'?m:mate,negative=info.side==='negative'?m:mate;
@@ -1171,9 +1379,9 @@ $('pegApplyBtn').onclick=async()=>{
   newPositive.userData.bisturiCut.mate=newNegative.uuid;newNegative.userData.bisturiCut.mate=newPositive.uuid;
   newPositive.userData.bisturiCut.connectorCount=centers.length;newNegative.userData.bisturiCut.connectorCount=centers.length;
   enlazarEncastre(newPositive,newNegative,[]);
-  selected=newPositive;dirty=true;refreshBeds();updateList();updateStats();fit();
-const gap=c.depth+(c.shape==='dovetail'?c.height+c.clearance:0)+10;separateForReview(newPositive,sepNormal,gap);updateList();fit();
-  const sep=` Las dos mitades se separaron ${gap.toFixed(0)} mm para que veas los encastres; «Deshacer» las vuelve a juntar.`;
+  // Las piezas se quedan en su sitio (para verlas separadas está la «Demostración»).
+  selected=newPositive;dirty=true;refreshBeds();updateList();updateStats();
+  const sep='';
   if(c.shape==='dovetail'){
     status(`${centers.length} cola(s) de milano deslizante(s): riel de ${c.height.toFixed(1)} mm de largo, ${(c.width-2*c.taper).toFixed(1)} → ${c.width.toFixed(1)} mm de ancho y ${c.depth.toFixed(1)} mm de alto; canal con ${c.clearance.toFixed(2)} mm de holgura y entrada. Monta apoyando el riel en la entrada y deslizándolo hasta el tope.`+sep);
   }else if(c.shape==='rectangular'){
@@ -1182,7 +1390,81 @@ const gap=c.depth+(c.shape==='dovetail'?c.height+c.clearance:0)+10;separateForRe
     const dims=inspectConnectorSpec(c);
     status(`${centers.length} pasador(es): Ø${dims.pegDiameter.toFixed(2)} mm; alojamiento Ø${dims.socketDiameter.toFixed(2)} mm; holgura radial ${c.clearance.toFixed(2)} mm.`+sep);
   }
+}
+// Modo sencillo: tipo, cantidad y tamaño. Con el tamaño vacío («Auto») se prueba del más grande
+// que cabe en la cara del corte al más pequeño, y se queda con el primero que funciona.
+function fijarTamanoEncastre(t){
+  const r=v=>String(Math.round(v*10)/10);
+  $('pegDiameter').value=r(t);$('pegDepth').value=r(Math.max($('pegShape').value==='alignment'?5:3,1.2*t));$('pegSpacing').value=r(Math.max(2.4*t,t+3));
+  if($('pegShape').value==='dovetail'){$('rectWidth').value=r(1.6*t);$('rectHeight').value=r(1.5*t);$('dovetailTaper').value=r(Math.max(.4,.3*t))}
+  else{$('rectWidth').value=r(t);$('rectHeight').value=r(Math.max(1,.8*t))}
+  pegCustomOffsets=null;pegAutoInfo=null;clearPegMarkers();
+}
+function tamanosEncastre(info){
+  const pedido=Number(String($('pegSize')?.value||'').replace(',','.'));
+  if(pedido>0)return [Math.min(40,Math.max(1,pedido))];
+  const tope=Math.max(2,(info?.maxRadius||10)*0.85),lista=[10,8,6,5,4,3,2.5,2].filter(t=>t<=tope);
+  return lista.length?lista:[2];
+}
+// Devuelve true si el encastre quedó puesto.
+async function agregarEncastre(){
+  let pair;try{pair=selectedCutPair()}catch(e){status('No se pudo agregar el encastre: '+e.message);return false}
+  const hecho=()=>!meshes.includes(pair.m)||conEncastre(pair.m);
+  const simple=$('pegAvanzado')?!$('pegAvanzado').open:false;
+  if(!simple){await aplicarEncastreUna();const t=$('status').textContent;if(!hecho()&&!/^No se pudo/.test(t))status('No se pudo agregar el encastre: '+t);return hecho()}
+  const tams=tamanosEncastre(pair.info||pair.curva?.info);let ultimo='';
+  for(const t of tams){
+    fijarTamanoEncastre(t);
+    try{await aplicarEncastreUna()}catch(e){console.error(e);status(e.message)}
+    if(hecho()){if($('pegSize')&&!$('pegSize').value)$('pegSize').placeholder=`Auto (${t} mm)`;return true}
+    ultimo=$('status').textContent;
+    if(!/no cabe|no caben|delgad|solapan|próxim|fuera|demasiado|pared|espacio|grande/i.test(ultimo))break;
+  }
+  ultimo=ultimo.replace(/^No se pudo agregar el encastre:\s*/,'');
+  status('No se pudo agregar el encastre: '+(tams.length>1&&/no cabe|delgad|pared|espacio/i.test(ultimo)?'la cara del corte es demasiado pequeña o delgada para este tipo. Prueba «Cilindro» o corta por una zona más ancha.':ultimo));
+  return false;
+}
+// «Demostración» en Encastres: calcula el encastre sin aplicarlo y muestra las piezas separadas
+// con el pasador y el alojamiento. «Agregar encastre» deja exactamente lo que se ve.
+let vistaEnc=null;
+function vistaDeEncastre(){
+  if(vistaEnc)return vistaEnc;
+  // Solo se separan las dos piezas del encastre; el resto del modelo se queda quieto.
+  const base=vistaPorCorte(()=>agregarEncastre(),deltasEncastre);
+  vistaEnc={...base,texto:'Vista previa del encastre: mueve el deslizador para ver las piezas separadas. «Agregar encastre» lo pone y las piezas quedan en su sitio.',
+    async iniciar(){clearPegMarkers();return base.iniciar()},
+    terminar(conservar){const r=base.terminar(conservar);if(!conservar&&encastresAbierto)setTimeout(()=>{if(!vistaActiva&&!calculandoVista)vistaEncastreAuto()},0);return r}};
+  return vistaEnc;
+}
+let encastresAbierto=false;
+$('pegApplyBtn').onclick=async()=>{
+  if(vistaEnc&&vistaActiva===vistaEnc){cerrarVista(true);status('Encastre agregado; las piezas quedan en su sitio.');return}
+  if(calculandoVista&&vistaHerr===vistaEnc){await calculandoVista;if(vistaActiva===vistaEnc){cerrarVista(true);status('Encastre agregado; las piezas quedan en su sitio.');return}}
+  await agregarEncastre();
 };
+// Vista de la ubicación al abrir el panel (sin mensajes si todavía no hay corte).
+function vistaEncastreAuto(){
+  if($('pegSize'))$('pegSize').placeholder='Auto';
+  try{const pair=selectedCutPair();if(pair.curva){clearPegMarkers();return}if($('pegAvanzado')&&!$('pegAvanzado').open)fijarTamanoEncastre(tamanosEncastre(pair.info)[0]);
+    // En modelos muy grandes la vista de ubicación tarda: no se calcula sola.
+    const tris=x=>(x.geometry.index?x.geometry.index.count:x.geometry.attributes.position.count)/3;
+    if(tris(pair.m)+tris(pair.mate)<=300000)$('pegPreviewBtn').click();else clearPegMarkers()}catch(e){clearPegMarkers()}
+}
+function entrarEncastres(){
+  encastresAbierto=true;const v=vistaDeEncastre();
+  if(vistaHerr!==v){if(vistaActiva)cerrarVista(false);vistaHerr=v;avisarVista(false)}
+  setTimeout(async()=>{if(!encastresAbierto)return;if(demoActiva){if(!await abrirVista())vistaEncastreAuto()}else vistaEncastreAuto()},50);
+}
+function salirEncastres(){
+  if(!encastresAbierto)return;encastresAbierto=false;clearPegMarkers();
+  if(vistaEnc&&vistaHerr===vistaEnc){if(vistaActiva)cerrarVista(false);vistaHerr=null;avisarVista(false)}
+}
+window.addEventListener('cajon-abierto',e=>{if(e.detail==='encastres')entrarEncastres();else{salirEncastres();clearPegMarkers()}});
+window.addEventListener('cajon-cerrado',e=>{if(e.detail==='encastres')salirEncastres()});
+['pegShape','pegCount','pegSize'].forEach(id=>document.addEventListener('change',e=>{
+  if(e.target?.id!==id)return;
+  if(vistaEnc&&vistaHerr===vistaEnc&&demoActiva){setTimeout(()=>rehacerVista(),0);return}
+  if($('pegAvanzado')&&!$('pegAvanzado').open)setTimeout(vistaEncastreAuto,0)}));
 
 // Encastres redondos como en la primera versión: pin pegado (macho-hembra) o pasadores sueltos.
 // La comprobación es relativa: el encastre no puede abrir bordes nuevos en la malla, pero no
@@ -1232,11 +1514,8 @@ async function applyV2fConnectors(pair,c){
     root.add(piece);meshes.push(piece);basePositions.set(piece.uuid,piece.position.clone());originalMaterials.set(piece.uuid,piece.material);
   });
   enlazarEncastre(nm,nmate,meshes.slice(n0));
-  selected=nm;dirty=true;refreshBeds();updateList();updateStats();fit();
-  // Separa la mitad positiva a lo largo de la normal del corte para que se vean pines y agujeros.
-  const positive=nm.userData.bisturiCut.side==='positive'?nm:nmate,axes=pegAxes(positive.userData.bisturiCut,positive);
-  const deepest=Math.max(...r.ubicaciones.map(u=>Math.max(...u.profundidad))),gap=deepest+10;
-  separateForReview(positive,axes.normal,gap);updateList();fit();
+  // Las piezas se quedan en su sitio (para verlas separadas está la «Demostración»).
+  selected=nm;dirty=true;refreshBeds();updateList();updateStats();
   const depths=[...new Set(r.ubicaciones.map(u=>(c.shape==='alignment'?u.profundidad[0]+u.profundidad[1]-0.6:u.profundidad[1]).toFixed(1)))].join(', ');
   const moved=r.ubicaciones.filter(u=>u.movido>0.05).length,missing=c.count-r.ubicaciones.length;
   let t=c.shape==='alignment'
@@ -1244,11 +1523,160 @@ async function applyV2fConnectors(pair,c){
     :`${r.ubicaciones.length} encastre(s) macho-hembra: pin de Ø${c.diameter.toFixed(1)} mm y ${depths} mm de alto; el agujero (Ø${(c.diameter+2*c.clearance).toFixed(2)} mm) va en la mitad más gruesa.`;
   if(moved)t+=` ${moved} se movió al punto válido más cercano.`;
   if(missing>0)t+=` No cupieron ${missing} con esa medida y pared.`;
-  status(t+` La mitad positiva se separó ${gap.toFixed(0)} mm para que veas los encastres; «Deshacer» la vuelve a juntar.`);
+  status(t);
 }
 
 // Pasadores de alineación desmontables: dos alojamientos frente a frente y piezas STL independientes.
 // Experimentales: revisar dimensión real, espesor, sentido de montaje y tolerancia en un laminador.
+// Repaso tras una operación booleana: se cosen las grietas y se cierran agujeros, solo cerca de
+// la zona tocada (caja), así el resto de la malla no cambia.
+async function repasarBooleano(g,caja){
+  const margen=Math.max(3,caja.getSize(new THREE.Vector3()).length()*0.2),O=caja.clone().expandByScalar(margen),I=caja.clone().expandByScalar(margen/2);
+  const fuera_I=(x,y,z)=>x<I.min.x||y<I.min.y||z<I.min.z||x>I.max.x||y>I.max.y||z>I.max.z;
+  const malos=gg=>{const q=analyzeMeshGeometry(gg,{tolerance:1e-6,maxTriangles:4000000,degenerateEdges:true});return q.level==='unknown'?Infinity:q.boundary+q.nonManifold+q.winding};
+  const p=g.attributes.position,ix=g.index,n=(ix?ix.count:p.count)/3,sopa=new Float32Array(n*9),mat=new Int16Array(n);
+  for(let f=0;f<n;f++)for(let k=0;k<3;k++){const v=ix?ix.getX(3*f+k):3*f+k;sopa[9*f+3*k]=p.getX(v);sopa[9*f+3*k+1]=p.getY(v);sopa[9*f+3*k+2]=p.getZ(v)}
+  for(const gr of g.groups)for(let f=gr.start/3;f<Math.min(n,(gr.start+gr.count)/3);f++)mat[f]=gr.materialIndex??0;
+  const id4=new THREE.Matrix4(),dentroO=new Uint8Array(n);let nz=0;
+  for(let f=0;f<n;f++){let ok=1;for(let k=0;k<3&&ok;k++){const x=sopa[9*f+3*k],y=sopa[9*f+3*k+1],z=sopa[9*f+3*k+2];if(x<O.min.x||y<O.min.y||z<O.min.z||x>O.max.x||y>O.max.y||z>O.max.z)ok=0}if(ok){dentroO[f]=1;nz++}}
+  const zS=new Float32Array(nz*9),zM=new Int16Array(nz),rS=new Float32Array((n-nz)*9),rM=new Int16Array(n-nz);
+  for(let f=0,i=0,j=0;f<n;f++){if(dentroO[f]){zS.set(sopa.subarray(9*f,9*f+9),9*i);zM[i++]=mat[f]}else{rS.set(sopa.subarray(9*f,9*f+9),9*j);rM[j++]=mat[f]}}
+  let zona=geometryFromSoup(zS,zM,id4);
+  for(let k=0;k<3;k++){const g2=repararUnionesT(THREE,zona,{fijo:fuera_I});zona.dispose();zona=g2}
+  try{const r=await repararMalla(THREE,zona,{fijo:fuera_I,orientarCaras:false});zona.dispose();zona=r.geometry}catch(e){console.warn(e)}
+  const zp=zona.attributes.position,zi=zona.index,zn=(zi?zi.count:zp.count)/3,zs=new Float32Array(zn*9),zm=new Int16Array(zn);
+  for(let f=0;f<zn;f++)for(let k=0;k<3;k++){const v=zi?zi.getX(3*f+k):3*f+k;zs[9*f+3*k]=zp.getX(v);zs[9*f+3*k+1]=zp.getY(v);zs[9*f+3*k+2]=zp.getZ(v)}
+  for(const gr of zona.groups)for(let f=gr.start/3;f<Math.min(zn,(gr.start+gr.count)/3);f++)zm[f]=gr.materialIndex??0;
+  zona.dispose();
+  const todo=new Float32Array(rS.length+zs.length),tm=new Int16Array(rM.length+zm.length);todo.set(rS);todo.set(zs,rS.length);tm.set(rM);tm.set(zm,rM.length);
+  let out=geometryFromSoup(todo,tm,id4);
+  // Si aún quedan grietas y la malla no es enorme, se repasa entera.
+  if(malos(out)>0&&n<=150000){try{const r=await repararMalla(THREE,out);if(malos(r.geometry)<malos(out)){out.dispose();out=r.geometry}else r.geometry.dispose()}catch(e){console.warn(e)}}
+  return malos(out)<=malos(g)?out:(out.dispose(),g);
+}
+// Limpieza final tras un booleano: quita triángulos repetidos o sin área y cierra agujeros pequeños.
+function limpiarCosturas(g,escala=1e4){
+  const p=g.attributes.position,ix=g.index,n=(ix?ix.count:p.count)/3,k=v=>Math.round(p.getX(v)*escala)+','+Math.round(p.getY(v)*escala)+','+Math.round(p.getZ(v)*escala);
+  const mat=new Int16Array(n);for(const gr of g.groups)for(let f=gr.start/3;f<Math.min(n,(gr.start+gr.count)/3);f++)mat[f]=gr.materialIndex??0;
+  const tri=[],pts=new Map(),coord=[];
+  const id=v=>{const key=k(v);let i=pts.get(key);if(i===undefined){i=coord.length/3;pts.set(key,i);coord.push(p.getX(v),p.getY(v),p.getZ(v))}return i};
+  for(let f=0;f<n;f++){const a=id(ix?ix.getX(3*f):3*f),b=id(ix?ix.getX(3*f+1):3*f+1),c=id(ix?ix.getX(3*f+2):3*f+2);if(a===b||b===c||a===c)continue;tri.push([a,b,c,mat[f]])}
+  // Repetidos: misma terna. Con orientación opuesta se anulan (pared doble); con la misma, se deja uno.
+  const porClave=new Map();for(const t of tri){const key=[t[0],t[1],t[2]].sort((x,y)=>x-y).join();let l=porClave.get(key);if(!l)porClave.set(key,l=[]);l.push(t)}
+  const orient=t=>{const m=Math.min(t[0],t[1],t[2]),i=t.indexOf(m);return [t[i],t[(i+1)%3],t[(i+2)%3]].join()};
+  let lista=[];for(const l of porClave.values()){if(l.length===1){lista.push(l[0]);continue}const grupos=new Map();for(const t of l){const o=orient(t);grupos.set(o,(grupos.get(o)||[]).concat([t]))}const [x,y]=[...grupos.values()];if(!y)lista.push(x[0]);else if(x.length>y.length)lista.push(x[0]);else if(y.length>x.length)lista.push(y[0])}
+  // Agujeros pequeños: bordes (aristas con una sola cara) que forman un lazo corto.
+  const usos=new Map();for(const t of lista)for(let j=0;j<3;j++){const a=t[j],b=t[(j+1)%3];usos.set(a+'>'+b,t)}
+  // Bordes sin dirección (una grieta puede tener los lados mal orientados).
+  const bordes=new Map(),adj=new Map(),agrega=(a,b)=>{let l=adj.get(a);if(!l)adj.set(a,l=[]);l.push(b)};
+  for(const t of lista)for(let j=0;j<3;j++){const a=t[j],b=t[(j+1)%3];if(!usos.has(b+'>'+a)){const key=a<b?a+','+b:b+','+a;bordes.set(key,(bordes.get(key)||0)+1)}}
+  for(const [key,c] of bordes)if(c===1){const [a,b]=key.split(',').map(Number);agrega(a,b);agrega(b,a)}
+  // Cada arista de borde: el lazo más corto que la cierra (puede pasar por vértices con más de dos bordes).
+  const quitarA=(a,b)=>{adj.set(a,(adj.get(a)||[]).filter(x=>x!==b));adj.set(b,(adj.get(b)||[]).filter(x=>x!==a))};
+  for(const a0 of [...adj.keys()])while((adj.get(a0)||[]).length){
+    const b0=adj.get(a0)[0];quitarA(a0,b0);
+    const prev=new Map([[b0,-1]]),cola=[b0];let hallado=false;
+    while(cola.length&&!hallado){const v=cola.shift();if(prev.size>200)break;for(const w of adj.get(v)||[]){if(prev.has(w))continue;prev.set(w,v);if(w===a0){hallado=true;break}cola.push(w)}}
+    if(!hallado)continue;
+    const lazo=[];for(let v=a0;v!==-1;v=prev.get(v))lazo.push(v); // a0 … b0
+    if(lazo.length<3||lazo.length>24)continue;
+    for(let q=0;q+1<lazo.length;q++)quitarA(lazo[q],lazo[q+1]);
+    // Orientación: la tapa recorre el borde al revés que la cara vecina (arista b0→a0 o a0→b0).
+    const vecina=usos.get(a0+'>'+b0),m0=(vecina||usos.get(b0+'>'+a0))?.[3]??0;
+    const C=vecina?lazo:[...lazo].reverse(); // el ciclo a0…b0 cierra con b0→a0
+    for(let q=1;q<C.length-1;q++)lista.push([C[0],C[q],C[q+1],m0]);
+  }
+  const sopa=new Float32Array(lista.length*9),col=new Int16Array(lista.length);
+  lista.forEach((t,i)=>{for(let j=0;j<3;j++){sopa[9*i+3*j]=coord[3*t[j]];sopa[9*i+3*j+1]=coord[3*t[j]+1];sopa[9*i+3*j+2]=coord[3*t[j]+2]}col[i]=t[3]});
+  return geometryFromSoup(sopa,col,new THREE.Matrix4());
+}
+// Encastre en una cara de corte curva (Separación inteligente, Bisturí magnético, Corte curvo…).
+// Se busca el punto de la cara con más material alrededor, el eje sigue la normal de la cara en ese
+// punto y los agujeros/pines se hacen con operaciones booleanas en las dos piezas.
+async function encastreCurvo(pair,c){
+  if(bedMode||explode||xray)return status('Vuelve a la vista ensamblada del modelo y desactiva Rayos X.');
+  if(c.shape==='dovetail')return status('No se pudo agregar el encastre: la cola de milano necesita una cara de corte plana. Elige otro tipo.');
+  const {a:m,b:mate,caras,datos:A}=pair.curva,P=A.p,T=A.tri,minWall=Number($('pegMinWall').value)||1.2;
+  status('Calculando encastres…');await new Promise(r=>requestAnimationFrame(()=>setTimeout(r,20)));
+  // Borde de la cara compartida.
+  // (por posición: la malla puede no tener los vértices compartidos)
+  const kv=v=>Math.round(P[3*v]*1000)+','+Math.round(P[3*v+1]*1000)+','+Math.round(P[3*v+2]*1000);
+  const aristas=new Map();for(const f of caras)for(let k=0;k<3;k++){const x=T[3*f+k],y=T[3*f+(k+1)%3],kx=kv(x),ky=kv(y),key=kx<ky?kx+'|'+ky:ky+'|'+kx;const e=aristas.get(key);if(e)e.n++;else aristas.set(key,{n:1,v:x})}
+  const borde=[];for(const e of aristas.values())if(e.n===1)borde.push(e.v);
+  const paso=Math.max(1,Math.floor(borde.length/1500)),bordeS=borde.filter((_,i)=>i%paso===0);
+  const cen=f=>{const i=3*T[3*f],j=3*T[3*f+1],k=3*T[3*f+2];return [(P[i]+P[j]+P[k])/3,(P[i+1]+P[j+1]+P[k+1])/3,(P[i+2]+P[j+2]+P[k+2])/3]};
+  const pasoC=Math.max(1,Math.floor(caras.length/2500)),cand=[];
+  for(let i=0;i<caras.length;i+=pasoC){const q=cen(caras[i]);let d=Infinity;for(const v of bordeS)d=Math.min(d,Math.hypot(P[3*v]-q[0],P[3*v+1]-q[1],P[3*v+2]-q[2]));cand.push({q,d,f:caras[i]})}
+  cand.sort((x,y)=>y.d-x.d);
+  const rad=(c.shape==='rectangular'?Math.hypot(Number($('rectWidth').value),Number($('rectHeight').value))/2:c.diameter/2)+c.clearance;
+  const elegidos=[];for(const k of cand){if(k.d<rad+minWall)break;if(elegidos.every(e=>Math.hypot(e.q[0]-k.q[0],e.q[1]-k.q[1],e.q[2]-k.q[2])>=c.spacing))elegidos.push(k);if(elegidos.length>=c.count)break}
+  if(!elegidos.length)return status(`No se pudo agregar el encastre: no cabe uno de Ø${(2*rad).toFixed(1)} mm con pared de ${minWall} mm en la cara del corte.`);
+  // Normal local de la cara alrededor de cada punto (sale de «m» hacia «mate»).
+  const normalEn=q=>{let nx=0,ny=0,nz=0;for(const f of caras){const z=cen(f);if(Math.hypot(z[0]-q[0],z[1]-q[1],z[2]-q[2])>rad*1.5)continue;const i=3*T[3*f],j=3*T[3*f+1],k=3*T[3*f+2];const ux=P[j]-P[i],uy=P[j+1]-P[i+1],uz=P[j+2]-P[i+2],vx=P[k]-P[i],vy=P[k+1]-P[i+1],vz=P[k+2]-P[i+2];nx+=uy*vz-uz*vy;ny+=uz*vx-ux*vz;nz+=ux*vy-uy*vx}return new THREE.Vector3(nx,ny,nz).normalize()};
+  // Grosor de cada pieza a lo largo del eje (para no atravesarla).
+  const rc=new THREE.Raycaster();
+  const dobles=new Map(),doble=mesh=>{let d=dobles.get(mesh);if(!d){d=new THREE.Mesh(mesh.geometry,new THREE.MeshBasicMaterial({side:THREE.DoubleSide}));dobles.set(mesh,d)}mesh.updateWorldMatrix(true,false);d.matrixWorld.copy(mesh.matrixWorld);return d};
+  const grosor=(mesh,o,dir)=>{const D=doble(mesh),Mw=D.matrixWorld,ow=o.clone().addScaledVector(dir,1e-3).applyMatrix4(Mw),dw=dir.clone().transformDirection(Mw);rc.set(ow,dw);rc.near=0;rc.far=500;const h=rc.intersectObject(D,false).find(x=>x.distance>1e-3);if(!h)return 0;const s=new THREE.Vector3();mesh.getWorldScale(s);return h.distance/((s.x+s.y+s.z)/3)};
+  const piezas=[];
+  for(const e of elegidos){
+    const o=new THREE.Vector3(...e.q),n=normalEn(e.q);
+    const tM=grosor(m,o,n.clone().negate()),tO=grosor(mate,o,n);
+    const hM=Math.min(c.shape==='alignment'?c.depth/2:c.depth,tM-minWall),hO=Math.min(c.shape==='alignment'?c.depth/2:c.depth,tO-minWall);
+    piezas.push({o,n,hM,hO,tM,tO});
+  }
+  // Las dos piezas deben tener cuerpo suficiente: no se ponen encastres en láminas finas (como una mancha).
+  const ok=piezas.filter(x=>(c.shape==='alignment'?Math.min(x.hM,x.hO):Math.max(x.hM,x.hO))>=2&&Math.min(x.tM,x.tO)>=minWall+2);
+  if(!ok.length)return status(`No se pudo agregar el encastre: «${m.name}» o «${mate.name}» es demasiado delgada en la unión para llevar un encastre.`);
+  const csg=await loadCSG(),ev=new csg.Evaluator();ev.attributes=['position'];ev.useGroups=true;
+  const prisma=(r,largo,o,n,inicio)=>{ // cilindro o caja a lo largo de n, desde o+n·inicio, con «largo» mm
+    const g=c.shape==='rectangular'?new THREE.BoxGeometry(2*r*Number($('rectWidth').value)/Math.hypot(Number($('rectWidth').value),Number($('rectHeight').value)),largo,2*r*Number($('rectHeight').value)/Math.hypot(Number($('rectWidth').value),Number($('rectHeight').value))):new THREE.CylinderGeometry(r,r,largo,40,1);
+    g.translate(0,inicio+largo/2,0);g.applyQuaternion(new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,1,0),n));g.translate(o.x,o.y,o.z);return g};
+  const capMat=new THREE.MeshStandardMaterial({color:0xd5c2a5,roughness:.8,side:THREE.DoubleSide});
+  // Para la operación booleana la malla va soldada (vértices compartidos): así sale cerrada.
+  const soldada=src=>{const p=src.attributes.position,ix=src.index,n=ix?ix.count:p.count,mapa=new Map(),pos=[],idx=new Uint32Array(n);
+    for(let i=0;i<n;i++){const v=ix?ix.getX(i):i,x=p.getX(v),y=p.getY(v),z=p.getZ(v),k=x+','+y+','+z;let j=mapa.get(k);if(j===undefined){j=pos.length/3;mapa.set(k,j);pos.push(x,y,z)}idx[i]=j}
+    const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));g.setIndex(new THREE.BufferAttribute(idx,1));for(const gr of src.groups)g.addGroup(gr.start,gr.count,gr.materialIndex);return g};
+  const brocha=mesh=>{const g=soldada(mesh.geometry);if(!g.groups.length)g.addGroup(0,g.index?g.index.count:g.attributes.position.count,0);const b=new csg.Brush(g,(Array.isArray(mesh.material)?mesh.material:[mesh.material]));b.updateMatrixWorld(true);return b};
+  let bM=brocha(m),bO=brocha(mate);const pines=[],r0=c.diameter/2,rH=(c.shape==='rectangular'?Math.hypot(Number($('rectWidth').value),Number($('rectHeight').value))/2:r0)+c.clearance;
+  try{
+    for(const x of ok){
+      if(c.shape==='alignment'){
+        const hueco=new csg.Brush(prisma(rH,x.hM+x.hO,x.o,x.n,-x.hM),capMat);hueco.updateMatrixWorld(true);
+        bM=ev.evaluate(bM,hueco,csg.SUBTRACTION);bO=ev.evaluate(bO,hueco,csg.SUBTRACTION);
+        pines.push({g:prisma(r0,x.hM+x.hO-0.4,x.o,x.n,-x.hM+0.2),d:2*r0,largo:x.hM+x.hO-0.4});
+      }else{
+        // La hembra va en la pieza más gruesa; el macho sale de la otra.
+        const hembraEnM=x.tM>=x.tO,hf=hembraEnM?x.hM:x.hO,dir=hembraEnM?x.n.clone().negate():x.n.clone();
+        const hueco=new csg.Brush(prisma(rH,hf,x.o,dir,0),capMat),macho=new csg.Brush(prisma(c.shape==='rectangular'?rH-c.clearance:r0,hf-0.5+0.6,x.o,dir,-0.6),capMat);hueco.updateMatrixWorld(true);macho.updateMatrixWorld(true);
+        if(hembraEnM){bM=ev.evaluate(bM,hueco,csg.SUBTRACTION);bO=ev.evaluate(bO,macho,csg.ADDITION)}else{bO=ev.evaluate(bO,hueco,csg.SUBTRACTION);bM=ev.evaluate(bM,macho,csg.ADDITION)}
+      }
+    }
+  }catch(err){console.error(err);return status('No se pudo agregar el encastre: falló la operación en la malla ('+err.message+').')}
+  // Se cosen las grietas que deja la operación booleana, solo alrededor de los encastres.
+  const caja=new THREE.Box3();for(const x of ok)caja.expandByPoint(x.o.clone().addScaledVector(x.n,-x.hM-1)).expandByPoint(x.o.clone().addScaledVector(x.n,x.hO+1));caja.expandByScalar(rH+1);
+  status('Revisando la malla del encastre…');
+  const malos=gg=>{const q=analyzeMeshGeometry(gg,{tolerance:1e-6,maxTriangles:4000000,degenerateEdges:true});return q.level==='unknown'?Infinity:q.boundary+q.nonManifold+q.winding};
+  // Se prueban varias limpiezas y se queda la malla con menos defectos.
+  for(const b of [bM,bO]){
+    let mejor=b.geometry,mm=malos(mejor);const prueba=g=>{const x=malos(g);if(x<mm){if(mejor!==b.geometry)mejor.dispose();mejor=g;mm=x}else if(g!==mejor&&g!==b.geometry)g.dispose()};
+    for(const e of [1e4,1e3]){if(!mm)break;prueba(limpiarCosturas(b.geometry,e))}
+    if(mm){prueba(limpiarCosturas(mejor,1e3))}
+    if(mm){const r=await repasarBooleano(mejor,caja);if(r!==mejor){prueba(r);if(mm)prueba(limpiarCosturas(mejor,1e3))}}
+    if(mejor!==b.geometry){b.geometry.dispose();b.geometry=mejor}
+  }
+  save();(transform.detach(),gizmoTarget=null);
+  for(const x of [m,mate])if(!antesEncastre.has(x))antesEncastre.set(x,{geo:x.geometry,enlaces:[]});
+  const poner=(mesh,res)=>{const g=res.geometry;g.computeVertexNormals();g.computeBoundingBox();mesh.geometry=g;mesh.material=Array.isArray(res.material)?res.material:[res.material];originalMaterials.set(mesh.uuid,mesh.material);surfaceSelections.delete(mesh.uuid)};
+  poner(m,bM);poner(mate,bO);
+  const nuevos=pines.map(({g,d,largo},i)=>{const piece=new THREE.Mesh(g,new THREE.MeshStandardMaterial({color:0xf9c65f,roughness:.55}));
+    piece.name=`Pasador ${i+1} (Ø${d.toFixed(1)} × ${largo.toFixed(1)} mm)`;piece.userData.bisturiAlignmentPin={diameter:d,length:largo,clearance:c.clearance};
+    piece.position.copy(m.position);piece.quaternion.copy(m.quaternion);piece.scale.copy(m.scale);m.parent.add(piece);meshes.push(piece);basePositions.set(piece.uuid,piece.position.clone());originalMaterials.set(piece.uuid,piece.material);return piece});
+  enlazarEncastre(m,mate,nuevos);
+  clearSurfaceOverlays();dirty=true;refreshBeds();updateList();updateStats();
+  setTimeout(()=>revisarPiezas([m,mate,...nuevos],'corte'),0);
+  const tipo=c.shape==='alignment'?`${nuevos.length} pasador(es) suelto(s) de Ø${(2*r0).toFixed(1)} mm`:c.shape==='rectangular'?`${ok.length} encastre(s) rectangular(es)`:`${ok.length} pin(es) de Ø${(2*r0).toFixed(1)} mm`;
+  status(`Encastre agregado en la cara curva entre «${m.name}» y «${mate.name}»: ${tipo}. «Deshacer» lo quita.`);
+}
 async function applyLooseAlignmentPins(pair,c,positionInfo){
   if(bedMode||explode||xray)return status('Regresa a la figura ensamblada para crear pasadores de alineación.');
   const {m,mate,info}=pair;
@@ -1318,9 +1746,8 @@ async function applyLooseAlignmentPins(pair,c,positionInfo){
     root.add(piece);meshes.push(piece);basePositions.set(piece.uuid,piece.position.clone());originalMaterials.set(piece.uuid,piece.material);
   });
   enlazarEncastre(newPositive,newNegative,meshes.slice(n0));
-  selected=newPositive;dirty=true;refreshBeds();updateList();updateStats();fit();
-  const gap=depthPerSide+10;separateForReview(newPositive,alignNormal,gap);updateList();fit();
-  status(`${centers.length} pasador(es) desmontables (Ø${c.diameter.toFixed(2)} × ${c.depth.toFixed(1)} mm) y un alojamiento en cada mitad (Ø${(c.diameter+2*c.clearance).toFixed(2)} mm). La mitad positiva se separó ${gap.toFixed(0)} mm para que veas los alojamientos; «Deshacer» la vuelve a juntar. Asigna los pasadores a una cama para imprimirlos.`);
+  selected=newPositive;dirty=true;refreshBeds();updateList();updateStats();
+  status(`${centers.length} pasador(es) desmontables (Ø${c.diameter.toFixed(2)} × ${c.depth.toFixed(1)} mm) y un alojamiento en cada mitad (Ø${(c.diameter+2*c.clearance).toFixed(2)} mm). Asigna los pasadores a una cama para imprimirlos.`);
 }
 
 $('cutOrientation').onchange=()=>{$('cutAngles').hidden=$('cutOrientation').value!=='inclinado';refreshCutGuide()};
@@ -1362,6 +1789,7 @@ function ventana({titulo,texto,botones}){
   return fondo;
 }
 function revisarPiezas(lista,origen){
+  if(enVistaPrevia)return false;
   const malas=[];
   for(const m of lista){if(!meshes.includes(m))continue;let r;try{r=problemasDe(m)}catch(e){r=null}if(r&&r.n)malas.push({m,...r})}
   if(!malas.length)return false;
@@ -1752,6 +2180,37 @@ $('exportPlacedBed').onclick=()=>{
 refreshBeds();
 
 $('mobileShowCutResult').onclick=()=>{if($('mobileShowCutResult').disabled)return;$('explodeBtn').click();};
+// Modos de vista: «Objeto» (normal), «Rayos X» y «Malla» (vértices, aristas y caras).
+let modoMalla=false;const mallaVis=new Map();
+const matAristas=new THREE.LineBasicMaterial({color:0xbfe6ff,transparent:true,opacity:.55,depthWrite:false});
+const matVertices=new THREE.PointsMaterial({color:0xffd166,size:3.5,sizeAttenuation:false,depthWrite:false});
+function modoVista(){return modoMalla?'malla':xray?'rayos':'objeto'}
+function setModoVista(m){
+  if(!modelLoaded&&m!=='objeto')return status('Abre un modelo para cambiar la vista.');
+  const quiereX=m==='rayos';if(xray!==quiereX){xray=quiereX;applyVisualState()}
+  modoMalla=m==='malla';actualizarMalla();dirty=true;window.dispatchEvent(new CustomEvent('bisturi-modo-vista',{detail:m}));
+  if(modoMalla){let t=0;for(const x of meshes)t+=(x.geometry.index?x.geometry.index.count:x.geometry.attributes.position.count)/3;
+    status(t>600000?'Vista de malla: el modelo es muy grande, así que solo se dibujan las aristas marcadas además de los vértices.':'Vista de malla: se ven los vértices (amarillo), las aristas (celeste) y las caras.')}
+  else status(m==='rayos'?'Vista Rayos X: las piezas se ven transparentes.':'Vista normal del objeto.');
+}
+function actualizarMalla(){
+  if(!modoMalla){if(mallaVis.size){for(const v of mallaVis.values()){scene.remove(v.lineas,v.puntos);v.lineas.geometry.dispose()}mallaVis.clear()}return}
+  for(const [m,v] of mallaVis)if(!meshes.includes(m)){scene.remove(v.lineas,v.puntos);v.lineas.geometry.dispose();mallaVis.delete(m)}
+  let total=0;for(const x of meshes)total+=(x.geometry.index?x.geometry.index.count:x.geometry.attributes.position.count)/3;
+  for(const m of meshes){
+    let v=mallaVis.get(m);
+    if(!v||v.geo!==m.geometry){
+      if(v){scene.remove(v.lineas,v.puntos);v.lineas.geometry.dispose()}
+      const g=total>600000?new THREE.EdgesGeometry(m.geometry,20):new THREE.WireframeGeometry(m.geometry);
+      const pg=new THREE.BufferGeometry();pg.setAttribute('position',m.geometry.getAttribute('position'));
+      const lineas=new THREE.LineSegments(g,matAristas),puntos=new THREE.Points(pg,matVertices);
+      for(const o of [lineas,puntos]){o.matrixAutoUpdate=false;o.raycast=()=>{};o.renderOrder=6;scene.add(o)}
+      v={geo:m.geometry,lineas,puntos};mallaVis.set(m,v);
+    }
+    m.updateWorldMatrix(true,false);
+    for(const o of [v.lineas,v.puntos]){o.matrix.copy(m.matrixWorld);o.matrixWorldNeedsUpdate=true;o.visible=m.visible&&!!m.parent&&m.parent.visible!==false}
+  }
+}
 // Pieza seleccionada: tinte azul claro y contorno luminoso (distinto del ámbar de los pasadores,
 // el verde de la detección y el naranja del bisturí).
 const marca={tinte:null,brillo:null,mesh:null,geo:null};
@@ -1777,7 +2236,7 @@ function marcarSeleccion(){
   const sh=brillo.material.userData.sh;if(sh)sh.uniforms.grosor.value=marca.grosor;
   tinte.visible=brillo.visible=true;
 }
-function resize(){const w=viewport.clientWidth,h=viewport.clientHeight;if(w&&h){camera.aspect=w/h;camera.updateProjectionMatrix();renderer.setSize(w,h,false)}}new ResizeObserver(resize).observe(viewport);resize();renderer.setAnimationLoop(()=>{orbit.update();marcarSeleccion();if(gizmoTarget&&!transform.dragging){if(!meshes.includes(gizmoTarget)||!gizmoTarget.parent)(transform.detach(),gizmoTarget=null);else syncGizmoPivot();}renderer.render(scene,camera)});
+function resize(){const w=viewport.clientWidth,h=viewport.clientHeight;if(w&&h){camera.aspect=w/h;camera.updateProjectionMatrix();renderer.setSize(w,h,false)}}new ResizeObserver(resize).observe(viewport);resize();renderer.setAnimationLoop(()=>{orbit.update();gizmoNav.actualizar();marcarSeleccion();actualizarMalla();if(gizmoTarget&&!transform.dragging){if(!meshes.includes(gizmoTarget)||!gizmoTarget.parent)(transform.detach(),gizmoTarget=null);else syncGizmoPivot();}renderer.render(scene,camera)});
 
 // Interfaz de corte móvil: usa el mismo motor de corte del editor de escritorio.
 (function setupMobileCutUI(){
@@ -1957,6 +2416,21 @@ async function cutWithPlanes(planes,targets){
         obj.position.copy(out.positive.position);obj.quaternion.copy(out.positive.quaternion);obj.scale.copy(out.positive.scale);
         parent.add(obj);basePositions.set(obj.uuid,obj.position.clone());originalMaterials.set(obj.uuid,obj.material);return obj});
       meshes.splice(meshes.indexOf(out.positive),1,...nuevas);meshes.splice(meshes.indexOf(out.negative),1);
+      // Con dos piezas, la unión queda registrada para poder ponerle encastres (como en un corte completo).
+      if(nuevas.length===2){
+        const nA=n.toArray(),dC=out.result.planeOffset??d0,tol=Math.max(1e-4,Math.abs(dC)*1e-5);
+        const datos=r.piezas.map(pz=>{const S=pz.sopa;let A=0,cx=0,cy=0,cz=0,lado=0;
+          for(let o=0;o<S.length;o+=9){const d=[0,3,6].map(k=>nA[0]*S[o+k]+nA[1]*S[o+k+1]+nA[2]*S[o+k+2]-dC);
+            if(d.every(x=>Math.abs(x)<=tol)){const ux=S[o+3]-S[o],uy=S[o+4]-S[o+1],uz=S[o+5]-S[o+2],vx=S[o+6]-S[o],vy=S[o+7]-S[o+1],vz=S[o+8]-S[o+2],a=Math.hypot(uy*vz-uz*vy,uz*vx-ux*vz,ux*vy-uy*vx)/2;
+              A+=a;cx+=a*(S[o]+S[o+3]+S[o+6])/3;cy+=a*(S[o+1]+S[o+4]+S[o+7])/3;cz+=a*(S[o+2]+S[o+5]+S[o+8])/3}
+            else lado+=d[0]+d[1]+d[2]}
+          return {A,c:A?[cx/A,cy/A,cz/A]:null,lado}});
+        const iP=datos[0].lado>=datos[1].lado?0:1,base=datos[iP].c?datos[iP]:datos[1-iP];
+        if(base.c&&datos[0].A>0&&datos[1].A>0){
+          const pt=new THREE.Vector3(...base.c),info={point:base.c,normal:nA,maxRadius:Math.sqrt(Math.min(datos[0].A,datos[1].A)/Math.PI),localPoint:pt.clone().applyMatrix4(inv).toArray(),localNormal:n.clone().transformDirection(inv).toArray()};
+          nuevas[iP].userData.bisturiCut={...info,mate:nuevas[1-iP].uuid,side:'positive'};nuevas[1-iP].userData.bisturiCut={...info,mate:nuevas[iP].uuid,side:'negative'};
+        }
+      }
       for(const q of quitar){q.removeFromParent();q.geometry.dispose()}
       siguientes.push(...nuevas);hechos++;
     }
@@ -1977,23 +2451,15 @@ async function cutFreeShape(target,cortadores,pull){
   const csg=await loadCSG();
   target.updateWorldMatrix(true,false);
   const g=target.geometry.clone();for(const k of Object.keys(g.attributes))if(k!=='position')g.deleteAttribute(k);
-  g.applyMatrix4(target.matrixWorld);g.computeVertexNormals();
+  g.applyMatrix4(target.matrixWorld);
   if(!g.groups.length)g.addGroup(0,g.index?g.index.count:g.attributes.position.count,0);
+  // Para la operación booleana la malla va soldada (vértices compartidos y solo posiciones): así sale cerrada.
+  const soldar=src=>{const p=src.attributes.position,ix=src.index,n=ix?ix.count:p.count,mapa=new Map(),pos=[],idx=new Uint32Array(n);
+    for(let i=0;i<n;i++){const v=ix?ix.getX(i):i,x=p.getX(v),y=p.getY(v),z=p.getZ(v),k=x+','+y+','+z;let j=mapa.get(k);if(j===undefined){j=pos.length/3;mapa.set(k,j);pos.push(x,y,z)}idx[i]=j}
+    const o=new THREE.BufferGeometry();o.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));o.setIndex(new THREE.BufferAttribute(idx,1));for(const gr of src.groups)o.addGroup(gr.start,gr.count,gr.materialIndex);return o};
+  const gs=soldar(g);g.dispose();
   const mats=(Array.isArray(target.material)?target.material:[target.material]).map(x=>x.clone());
   const capMat=new THREE.MeshStandardMaterial({color:0xd5c2a5,roughness:.8,side:THREE.DoubleSide});
-  const a=new csg.Brush(g,mats),bH=new csg.Brush(cortadores.hueco,capMat),bP=new csg.Brush(cortadores.pieza,capMat);a.updateMatrixWorld(true);bH.updateMatrixWorld(true);bP.updateMatrixWorld(true);
-  const ev=new csg.Evaluator();ev.attributes=['position','normal'];ev.useGroups=true;
-  // La pieza sale del cortador encogido (holgura); el hueco, del cortador exacto.
-  const dentro=ev.evaluate(a,bP,csg.INTERSECTION);const fuera=ev.evaluate(a,bH,csg.SUBTRACTION);
-  const vacio=x=>!x.geometry.attributes.position||x.geometry.attributes.position.count<9;
-  if(vacio(dentro))throw Error('El trazo no corta material de la pieza. Dibuja sobre la figura.');
-  if(vacio(fuera))throw Error('El trazo abarca toda la pieza; dibuja una zona más pequeña.');
-  save();(transform.detach(),gizmoTarget=null);
-  const inv=target.matrixWorld.clone().invert(),sourceBed=beds.find(bd=>bd.items.includes(target.uuid));
-  const make=(res,nombre)=>{const geo=res.geometry;geo.applyMatrix4(inv);geo.computeVertexNormals();geo.computeBoundingBox();
-    const obj=new THREE.Mesh(geo,Array.isArray(res.material)?res.material:[res.material]);obj.name=nombre;
-    obj.position.copy(target.position);obj.quaternion.copy(target.quaternion);obj.scale.copy(target.scale);
-    target.parent.add(obj);basePositions.set(obj.uuid,obj.position.clone());originalMaterials.set(obj.uuid,obj.material);return obj};
   // Repaso final con la reparación automática (cierra las grietas que deja la operación booleana).
   // Repaso: se cosen las grietas del booleano y se cierran agujeros. En mallas grandes solo se
   // repara la zona del corte (el resto no cambia), así no hay que procesar millones de triángulos.
@@ -2023,13 +2489,42 @@ async function cutFreeShape(target,cortadores,pull){
     const todo=new Float32Array(rS.length+z.sopa.length),tm=new Int16Array(rM.length+z.mat.length);todo.set(rS);todo.set(z.sopa,rS.length);tm.set(rM);tm.set(z.mat,rM.length);
     const out=geometryFromSoup(todo,tm,id4);return out;
   }
-  for(const res of [dentro,fuera]){const g=await repasar(res.geometry);if(g!==res.geometry){res.geometry.dispose();res.geometry=g}}
+  const ev=new csg.Evaluator();ev.attributes=['position'];ev.useGroups=true;
+  const vacio=x=>!x.geometry.attributes.position||x.geometry.attributes.position.count<9;
+  const a=new csg.Brush(gs,mats);a.updateMatrixWorld(true);
+  // Limpieza tras el booleano: se prueban varias y se queda la que deja menos defectos.
+  async function limpiar(res){
+    let mejor=res.geometry,mm=malos(mejor);const prueba=x=>{const v=malos(x);if(v<mm){if(mejor!==res.geometry)mejor.dispose();mejor=x;mm=v}else if(x!==mejor&&x!==res.geometry)x.dispose()};
+    for(const e of [1e4,1e3]){if(!mm)break;prueba(limpiarCosturas(res.geometry,e))}
+    if(mm){const r=await repasar(mejor);if(r!==mejor){prueba(r);if(mm)prueba(limpiarCosturas(mejor,1e3))}}
+    if(mejor!==res.geometry){res.geometry.dispose();res.geometry=mejor}
+    return mm;
+  }
+  // Variantes del cortador (por ejemplo desplazado una centésima): si una deja defectos se prueba la siguiente.
+  // En la Demostración solo se calcula la primera (más rápido); al cortar se prueban todas.
+  const variantes=enVistaPrevia?[cortadores]:[cortadores,...(cortadores.alternativas||[])];let dentro=null,fuera=null,mejorTotal=Infinity;
+  for(let i=0;i<variantes.length;i++){
+    const c=variantes[i],bH=new csg.Brush(soldar(c.hueco),capMat),bP=new csg.Brush(soldar(c.pieza),capMat);bH.updateMatrixWorld(true);bP.updateMatrixWorld(true);
+    // La pieza sale del cortador encogido (holgura); el hueco, del cortador exacto.
+    const d=ev.evaluate(a,bP,csg.INTERSECTION),f=ev.evaluate(a,bH,csg.SUBTRACTION);
+    if(vacio(d)){if(i===0)throw Error('El trazo no corta material de la pieza. Dibuja sobre la figura.');continue}
+    if(vacio(f)){if(i===0)throw Error('El trazo abarca toda la pieza; dibuja una zona más pequeña.');continue}
+    const total=(await limpiar(d))+(await limpiar(f));
+    if(total<mejorTotal){dentro?.geometry.dispose();fuera?.geometry.dispose();dentro=d;fuera=f;mejorTotal=total}else{d.geometry.dispose();f.geometry.dispose()}
+    if(mejorTotal===0)break;
+  }
+  save();(transform.detach(),gizmoTarget=null);
+  const inv=target.matrixWorld.clone().invert(),sourceBed=beds.find(bd=>bd.items.includes(target.uuid));
+  const make=(res,nombre)=>{const geo=res.geometry;geo.applyMatrix4(inv);geo.computeVertexNormals();geo.computeBoundingBox();
+    const obj=new THREE.Mesh(geo,Array.isArray(res.material)?res.material:[res.material]);obj.name=nombre;
+    obj.position.copy(target.position);obj.quaternion.copy(target.quaternion);obj.scale.copy(target.scale);
+    target.parent.add(obj);basePositions.set(obj.uuid,obj.position.clone());originalMaterials.set(obj.uuid,obj.material);return obj};
   const pieza=make(dentro,target.name+' (pieza del bisturí)'),resto=make(fuera,target.name);
   target.removeFromParent();meshes.splice(meshes.indexOf(target),1,resto,pieza);
   if(sourceBed){sourceBed.items=sourceBed.items.filter(id=>id!==target.uuid);delete sourceBed.placements[target.uuid]}
   if(pull)separateForReview(pieza,pull.dir,pull.distance);
   selected=pieza;cutPair=[];syncResultButtons();dirty=true;refreshBeds();updateList();updateStats();
-  setTimeout(()=>revisarPiezas([pieza,resto],'corte'),0);
+  if(!enVistaPrevia)setTimeout(()=>revisarPiezas([pieza,resto],'corte'),0);
   const q=analyzeMeshGeometry(pieza.geometry,{tolerance:1e-6,maxTriangles:4000000,degenerateEdges:true});
   return {pieza,resto,cerrada:q.level!=='unknown'&&q.boundary===0};
 }
@@ -2098,33 +2593,141 @@ async function applyFreeZone(det,pull){
   setTimeout(()=>revisarPiezas([pieza,rest],'corte'),0);
   return {pieza};
 }
+
+// ---- Vista previa del corte con «Explosión» ----
+// Dentro de una herramienta de corte, «Explosión» muestra las piezas que saldrían, separadas, sin
+// cortar todavía. Para los cortes se calcula el corte de verdad y se deshace al salir de la vista;
+// «Hacer el corte» lo conserva.
+let enVistaPrevia=false,vistaHerr=null,vistaActiva=null;
+// Demostración: la pieza más grande se queda quieta y cada una de las demás se aparta de ella
+// exactamente la misma distancia (en la dirección de su centro), así todas se ven sueltas por igual.
+// Encastre: la pieza más pequeña del par se aparta de la grande hasta salir por completo de ella
+// (aunque esté metida dentro, como el tallo bajo el sombrero) y queda además un hueco para ver el pin.
+function deltasEncastre(par){
+  const d=new Map();if(par.length<2)return d;
+  root.updateMatrixWorld(true);
+  const cajas=par.map(m=>new THREE.Box3().setFromObject(m)),vol=c=>{const t=c.getSize(new THREE.Vector3());return t.x*t.y*t.z};
+  const bi=vol(cajas[0])>=vol(cajas[1])?0:1,base=par[bi];
+  const tam=cajas[0].clone().union(cajas[1]).getSize(new THREE.Vector3()).length();
+  const proyecciones=(m,dir)=>{const pos=m.geometry.attributes.position,paso=Math.max(1,Math.floor(pos.count/20000)),v=new THREE.Vector3();let lo=Infinity,hi=-Infinity;
+    for(let i=0;i<pos.count;i+=paso){v.fromBufferAttribute(pos,i).applyMatrix4(m.matrixWorld);const t=v.dot(dir);if(t<lo)lo=t;if(t>hi)hi=t}return [lo,hi]};
+  par.forEach((m,i)=>{
+    if(m===base){d.set(m,new THREE.Vector3());return}
+    const dir=cajas[i].getCenter(new THREE.Vector3()).sub(cajas[bi].getCenter(new THREE.Vector3()));
+    if(dir.length()<1e-6)dir.set(0,1,0);dir.normalize();
+    const [,b1]=proyecciones(base,dir),[m0]=proyecciones(m,dir);
+    // Con el deslizador al 50 % la pieza ya queda fuera y con hueco; al 100 % el doble.
+    const v=dir.multiplyScalar(2*(Math.max(0,b1-m0)+Math.max(12,tam*0.2)));
+    if(m.parent){const ps=new THREE.Vector3();m.parent.getWorldScale(ps);v.applyQuaternion(m.parent.getWorldQuaternion(new THREE.Quaternion()).invert());v.set(v.x/Math.max(1e-6,ps.x),v.y/Math.max(1e-6,ps.y),v.z/Math.max(1e-6,ps.z))}
+    d.set(m,v)});
+  return d;
+}
+function deltasSeparacion(lista){
+  root.updateMatrixWorld(true);const box=new THREE.Box3();for(const m of lista)box.expandByObject(m);
+  const tam=box.getSize(new THREE.Vector3()).length(),d=new Map();
+  const cajas=lista.map(m=>new THREE.Box3().setFromObject(m)),vol=c=>{const s=c.getSize(new THREE.Vector3());return s.x*s.y*s.z};
+  let base=0;cajas.forEach((c,i)=>{if(vol(c)>vol(cajas[base]))base=i});
+  const centroBase=cajas[base].getCenter(new THREE.Vector3());
+  lista.forEach((m,i)=>{
+    const v=new THREE.Vector3();
+    if(i!==base){
+      v.copy(cajas[i].getCenter(new THREE.Vector3())).sub(centroBase);
+      if(v.length()<tam*0.02)v.set(Math.cos(i*2.4),.4,Math.sin(i*2.4));
+      v.normalize().multiplyScalar(tam*0.25);
+    }
+    if(m.parent){const ps=new THREE.Vector3();m.parent.getWorldScale(ps);v.applyQuaternion(m.parent.getWorldQuaternion(new THREE.Quaternion()).invert());v.set(v.x/Math.max(1e-6,ps.x),v.y/Math.max(1e-6,ps.y),v.z/Math.max(1e-6,ps.z))}
+    d.set(m,v)});
+  return d;
+}
+function vistaPorCorte(ejecutar,calcularDeltas=null){
+  let estado=null;
+  return {
+    async iniciar(){
+      const antes=new Set(meshes),n0=undo.length;enVistaPrevia=true;let ok=false;
+      try{ok=await ejecutar()}catch(e){console.error(e);status('No se pudo calcular la vista previa: '+e.message)}finally{enVistaPrevia=false}
+      const nuevas=meshes.filter(m=>!antes.has(m));
+      if(!ok||!nuevas.length||undo.length===n0){if(undo.length>n0){restore(undo.pop())}return false}
+      const lista=meshes.filter(m=>m.visible);
+      estado={n0,nuevas,origen:new Map(lista.map(m=>[m,m.position.clone()])),deltas:calcularDeltas?calcularDeltas(nuevas):deltasSeparacion(lista)};
+      (transform.detach(),gizmoTarget=null);selected=null;updateList();
+      return true;
+    },
+    fijar(a){if(!estado)return;for(const [m,o] of estado.origen){const d=estado.deltas.get(m);if(d)m.position.copy(o).addScaledVector(d,a)}dirty=true},
+    terminar(conservar){
+      if(!estado)return null;const e=estado;estado=null;
+      for(const [m,o] of e.origen)m.position.copy(o);
+      if(!conservar){if(undo.length>e.n0){const primero=undo[e.n0];undo.length=e.n0;restore(primero)}refreshBeds();updateList();updateStats();return null}
+      selected=null;updateList();refreshBeds();updateStats();setTimeout(()=>revisarPiezas(e.nuevas.filter(m=>meshes.includes(m)),'corte'),0);
+      return e.nuevas;
+    }
+  };
+}
+// Casilla «Demostración»: en las herramientas de corte, la vista separada solo funciona con ella marcada.
+let demoActiva=false;
+function avisarVista(on,cantidad=cantidadVista){window.dispatchEvent(new CustomEvent('bisturi-explosion',{detail:{activa:on,cantidad,vista:on,herramienta:!!vistaHerr,demo:demoActiva}}))}
+async function fijarDemo(on){
+  demoActiva=!!on;
+  if(!vistaHerr)return;
+  if(!demoActiva){if(vistaActiva){cerrarVista(false);status('Demostración desactivada: el modelo queda armado.')}else avisarVista(false);return}
+  avisarVista(!!vistaActiva);if(!await abrirVista())avisarVista(false);
+}
+function cerrarVista(conservar=false){if(!vistaActiva)return null;const v=vistaActiva;vistaActiva=null;const r=v.terminar(conservar);avisarVista(false);return r}
+let calculandoVista=null,cantidadVista=.5;
+// Abre la vista previa del corte de la herramienta activa (también se llama sola al preparar un corte).
+async function abrirVista(){
+  if(vistaActiva||!vistaHerr||!demoActiva)return !!vistaActiva;
+  if(calculandoVista)return calculandoVista;
+  calculandoVista=(async()=>{
+    if(explode)$('explodeBtn').click();
+    const v=vistaHerr;
+    status('Calculando la vista previa del corte…');await new Promise(r=>requestAnimationFrame(()=>setTimeout(r,20)));
+    if(vistaHerr!==v)return false;
+    if(await v.iniciar()){
+      if(vistaHerr!==v){v.terminar(false);return false}
+      vistaActiva=v;v.fijar(cantidadVista);avisarVista(true,cantidadVista);
+      status(v.texto||'Vista previa del corte lista: marca «Demostración» y mueve el deslizador para ver las piezas separadas. «Hacer el corte» corta; Explosión cierra la vista.');return true}
+    if(!/No se pudo|Primero|Solo hay/.test($('status').textContent))status('Con lo que hay ahora no se separaría ninguna pieza: ajusta el corte y vuelve a probar.');
+    return false;
+  })();
+  try{return await calculandoVista}finally{calculandoVista=null}
+}
+async function rehacerVista(){if(calculandoVista)await calculandoVista;cerrarVista(false);return abrirVista()}
+async function alternarVista(){
+  if(calculandoVista)return;
+  if(!vistaHerr)return $('explodeBtn').click();
+  return fijarDemo(!vistaActiva);
+}
 setupBisturi({THREE,scene,camera,renderer,orbit,root,status,detectFreeZone,applyFreeZone,
   get meshes(){return meshes},get selected(){return selected},
-  busy:()=>bedMode||explode||xray,cutWithPlanes,cutFreeShape,
+  busy:()=>bedMode||explode||xray,cutWithPlanes,cutFreeShape,vistaPorCorte,registrarVista:v=>{if(vistaHerr===v)return;if(vistaActiva)cerrarVista(false);vistaHerr=v;avisarVista(false)},soltarVista:v=>{if(vistaHerr!==v)return;if(vistaActiva)cerrarVista(false);vistaHerr=null;avisarVista(false)},cerrarVista,abrirVista,rehacerVista,get enVista(){return !!vistaActiva},
   raycastTargets:()=>meshes.filter(m=>m.visible)});
-setupCortePlano({THREE,scene,camera,renderer,orbit,TransformControls,status,get meshes(){return meshes},get selected(){return selected},busy:()=>bedMode||explode||xray,cutWithPlanes});
-setupSeparacionInteligente({THREE,scene,camera,renderer,orbit,status,soupInFrame,faceColorKeys,faceMaterials,
+setupCortePlano({THREE,scene,camera,renderer,orbit,TransformControls,status,vistaPorCorte,registrarVista:v=>{if(vistaHerr===v)return;if(vistaActiva)cerrarVista(false);vistaHerr=v;avisarVista(false)},soltarVista:v=>{if(vistaHerr!==v)return;if(vistaActiva)cerrarVista(false);vistaHerr=null;avisarVista(false)},cerrarVista,abrirVista,rehacerVista,get enVista(){return !!vistaActiva},get meshes(){return meshes},get selected(){return selected},busy:()=>bedMode||explode||xray,cutWithPlanes});
+const ctxIntel={THREE,scene,camera,renderer,orbit,status,get modoVista(){return modoVista()},ocupadoSinVista:()=>bedMode||explode,registrarVista:v=>{if(vistaHerr===v)return;if(vistaActiva)cerrarVista(false);vistaHerr=v;avisarVista(false)},soltarVista:v=>{if(vistaHerr!==v)return;if(vistaActiva)cerrarVista(false);vistaHerr=null;avisarVista(false)},cerrarVista,abrirVista,rehacerVista,get enVista(){return !!vistaActiva},soupInFrame,faceColorKeys,faceMaterials,
   get meshes(){return meshes},get selected(){return selected},busy:()=>bedMode||explode||xray,
   revisar:l=>revisarPiezas(l,'corte'),
   onActivo:on=>{if(on){(transform.detach(),gizmoTarget=null);clearSurfaceOverlays()}},
-  aplicar(target,partes){
+  aplicar(target,partes,nombre=i=>`Objeto ${i+1}`){
     save();(transform.detach(),gizmoTarget=null);target.updateWorldMatrix(true,false);
     const inv=target.matrixWorld.clone().invert(),srcMats=Array.isArray(target.material)?target.material:[target.material];
     const nuevas=partes.map((p,i)=>{
       let n=0;for(const x of p.mallas)n+=x.malla.tri.length/3;
       const sopa=new Float32Array(n*9),col=new Int16Array(n);let k=0;
       for(const x of p.mallas){const P=x.malla.pos,T=x.malla.tri;for(let f=0;f<T.length/3;f++){for(let j=0;j<3;j++){const v=T[3*f+j];sopa[9*k+3*j]=P[3*v];sopa[9*k+3*j+1]=P[3*v+1];sopa[9*k+3*j+2]=P[3*v+2]}col[k++]=Math.min(srcMats.length-1,(x.col?x.col[f]:0)&63)}}
-      const obj=new THREE.Mesh(geometryFromSoup(sopa,col,inv),srcMats.map(q=>q.clone()));obj.name=`Objeto ${i+1}`;
+      const obj=new THREE.Mesh(geometryFromSoup(sopa,col,inv),srcMats.map(q=>q.clone()));obj.name=nombre(i);
       obj.position.copy(target.position);obj.quaternion.copy(target.quaternion);obj.scale.copy(target.scale);target.parent.add(obj);
       basePositions.set(obj.uuid,obj.position.clone());originalMaterials.set(obj.uuid,obj.material);return obj});
     target.removeFromParent();meshes.splice(meshes.indexOf(target),1,...nuevas);
     for(const b of beds){b.items=b.items.filter(id=>id!==target.uuid);delete b.placements[target.uuid]}
     selected=null;cutPair=[];syncResultButtons();dirty=true;refreshBeds();updateList();updateStats();applyVisualState?.();
     setTimeout(()=>revisarPiezas(nuevas,'corte'),0);
-  }});
+  }};
+setupSeparacionInteligente(ctxIntel);
+setupBisturiMagnetico(Object.assign(Object.create(ctxIntel),{vistaPorCorte,aplicar:(t,p,n)=>ctxIntel.aplicar(t,p,n),revisar:l=>revisarPiezas(l,'corte')}));
+// Bisturí curvo: varios cortes (uno por pieza atravesada) quedan en un solo «Deshacer».
+setupBisturiCurvo(Object.assign(Object.create(ctxIntel),{vistaPorCorte,cutFreeShape,marcaDeshacer:()=>undo.length,unirDeshacer:n=>{if(undo.length>n+1)undo.splice(n+1)}}));
 
 window.bisturi={
- setExplode:a=>{if(explode)setExplodeAmount(a)},get explode(){return explode},get xray(){return xray},
+ surfaceFaces:m=>surfaceSet(m),setModoVista,get modoVista(){return modoVista()},fijarDemo,get demo(){return demoActiva},get herramientaVista(){return !!vistaHerr},setExplode:a=>{if(vistaActiva){cantidadVista=a;vistaActiva.fijar(a)}else if(explode)setExplodeAmount(a)},get explode(){return explode||!!vistaActiva},alternarVista,get vistaPrevia(){return !!vistaActiva},get xray(){return xray},
  get meshes(){return meshes},get selected(){return selected},get tool(){return tool},get modelLoaded(){return modelLoaded},
  select,setTool,fit,setView,status,
  setTransformMode(mode){transform.setMode(mode);if(tool!=='Mover')setTool('Mover');else if(selected&&!explode&&!bedMode)attachGizmo(selected);},
