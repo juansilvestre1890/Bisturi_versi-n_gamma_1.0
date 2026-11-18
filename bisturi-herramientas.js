@@ -217,13 +217,14 @@ export function setupBisturi(ctx) {
     return caras;
   }
   // «Añadir» / «Quitar»: pincel sobre la zona.
-  // Caras que abarca el pincel en ese punto (radio de 22 px en pantalla).
+  // Caras que abarca el pincel en ese punto: radio de 22 px con ratón o lápiz; con el dedo, 34 px para que el círculo se vea alrededor de la yema.
+  const radioPincel = e => e.pointerType === 'touch' ? 34 : 22;
   function carasPincel(e) {
     const lista = zonaValida() ? [zona.target] : ctx.meshes.filter(m => m.visible && !m.userData.bisturiAlignmentPin);
     const h = rayo(punto(e)).intersectObjects(lista, false)[0]; if (!h || h.faceIndex == null) return null;
     const objetivo = h.object, d = datosMalla(objetivo), M = objetivo.matrixWorld, pl = h.point.clone().applyMatrix4(M.clone().invert());
     const r = lienzo.getBoundingClientRect(), dist = camera.position.distanceTo(h.point), escala = new THREE.Vector3(); objetivo.getWorldScale(escala);
-    const R = (camera.isPerspectiveCamera ? 2 * dist * Math.tan(camera.fov * Math.PI / 360) / r.height : (camera.top - camera.bottom) / camera.zoom / r.height) * 22 / ((escala.x + escala.y + escala.z) / 3), R2 = R * R;
+    const R = (camera.isPerspectiveCamera ? 2 * dist * Math.tan(camera.fov * Math.PI / 360) / r.height : (camera.top - camera.bottom) / camera.zoom / r.height) * radioPincel(e) / ((escala.x + escala.y + escala.z) / 3), R2 = R * R;
     const visto = new Set([h.faceIndex]), pila = [h.faceIndex], caras = [];
     while (pila.length) {
       const f = pila.pop(); caras.push(f);
@@ -238,19 +239,25 @@ export function setupBisturi(ctx) {
     dibujarZona(); sombraPincel(e);
   }
   // Sombra del pincel: oscurece lo que abarcará antes de pintar (y mientras se pinta).
-  const sombra = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: .38, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 }));
+  const sombra = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({ color: 0xffd23f, transparent: true, opacity: .5, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 }));
   sombra.matrixAutoUpdate = false; sombra.visible = false; sombra.renderOrder = 26; sombra.raycast = () => {}; scene.add(sombra);
+  const anillo = document.createElement('div'); anillo.className = 'anillo-pincel'; anillo.hidden = true; caja.append(anillo);
   let sombraT = 0;
   function sombraPincel(e) {
     clearTimeout(sombraT);
     const c = modo === 'libre' && pincelZona && !ctx.enVista ? carasPincel(e) : null;
-    if (!c) { sombra.visible = false; return; }
+    if (!c) { sombra.visible = false; anillo.hidden = true; return; }
+    // Círculo del pincel en pantalla: siempre se ve el tamaño, aunque el dedo tape el centro.
+    const rc = caja.getBoundingClientRect(), rp = radioPincel(e);
+    anillo.style.width = anillo.style.height = 2 * rp + 'px';
+    anillo.style.transform = `translate(${e.clientX - rc.left - rp}px,${e.clientY - rc.top - rp}px)`;
+    anillo.classList.toggle('quitar', pincelZona === 'quitar'); anillo.hidden = false;
     const d = datosMalla(c.objetivo), pos = new Float32Array(c.caras.length * 9); let k = 0;
     for (const f of c.caras) for (let j = 0; j < 3; j++) { const v = 3 * d.tri[3 * f + j]; pos[k++] = d.P[v]; pos[k++] = d.P[v + 1]; pos[k++] = d.P[v + 2]; }
     sombra.geometry.dispose(); sombra.geometry = new THREE.BufferGeometry(); sombra.geometry.setAttribute('position', new THREE.BufferAttribute(pos, 3));
     c.objetivo.updateWorldMatrix(true, false); sombra.matrix.copy(c.objetivo.matrixWorld); sombra.matrixWorldNeedsUpdate = true; sombra.visible = true;
   }
-  const quitarSombra = (espera = 0) => { clearTimeout(sombraT); sombraT = setTimeout(() => { sombra.visible = false; }, espera); };
+  const quitarSombra = (espera = 0) => { clearTimeout(sombraT); sombraT = setTimeout(() => { sombra.visible = false; anillo.hidden = true; window.bisturiRedibujar?.(); }, espera); };
   const zonaPara = () => ({ modo: 'zona', caras: zona.caras, target: zona.target, geometria: zona.geo });
   // Vista previa (Demostración) del corte por la zona.
   const vistaLibre = ctx.vistaPorCorte(async () => { if (!zonaValida() || !cuentaZona()) return false; await ctx.applyFreeZone(zonaPara()); return true; });
@@ -283,7 +290,7 @@ export function setupBisturi(ctx) {
     bQuitar.hidden = bBorrarZona.hidden = bCortarZona.hidden = !hayZona;
     $('bisturiQuitarPunto').hidden = $('bisturiBorrarPuntos').hidden = $('bisturiCerrar').hidden = !nodos.length;
     lienzo.style.cursor = modo === 'libre' && pincelZona ? 'cell' : modo ? 'crosshair' : '';
-    if (modo !== 'libre' || !pincelZona) sombra.visible = false;
+    if (modo !== 'libre' || !pincelZona) { sombra.visible = false; anillo.hidden = true; }
     if (modo === 'libre') $('bisturiLibreInfo').textContent = pincelZona ? (pincelZona === 'anadir' ? 'Añadir: pinta sobre la figura. Tócalo otra vez para dejar de pintar.' : 'Quitar: pinta sobre la zona verde. Tócalo otra vez para dejar de pintar.')
       : nodos.length ? $('bisturiLibreInfo').textContent
       : hayZona ? 'Zona verde lista. Puedes sumar otro contorno, corregir o «Hacer el corte».' : 'Toca alrededor de la zona para poner puntos, o usa «Añadir».';
@@ -453,7 +460,7 @@ export function setupBisturi(ctx) {
   }, { capture: true });
   caja.addEventListener('pointermove', e => {
     if (pintando === e.pointerId) { e.stopPropagation(); pintarZona(e); return; }
-    if (modo === 'libre' && pincelZona && e.pointerType === 'mouse' && e.target === lienzo && !e.buttons) sombraPincel(e);
+    if (modo === 'libre' && pincelZona && e.pointerType !== 'touch' && e.target === lienzo && !e.buttons && pintando == null) sombraPincel(e);
     if (!modo || pasar || !trazo || e.pointerId !== primero.pointerId) return;
     const p = punto(e);
     // Bisturí libre: un dedo nunca mueve la cámara (para girar o acercar se usan dos dedos o el botón derecho).
@@ -465,7 +472,7 @@ export function setupBisturi(ctx) {
   }, { capture: true });
   const fin = e => {
     activos.delete(e.pointerId);
-    if (pintando === e.pointerId) { pintando = null; e.stopPropagation(); try { caja.releasePointerCapture(e.pointerId); } catch (_) {} if (e.pointerType !== 'mouse') quitarSombra(400); return; }
+    if (pintando === e.pointerId) { pintando = null; e.stopPropagation(); try { caja.releasePointerCapture(e.pointerId); } catch (_) {} if (e.pointerType === 'touch') quitarSombra(900); return; }
     if (pasar) { if (!activos.size) pasar = false; return; }
     if (!modo || !trazo || e.pointerId !== primero.pointerId) return;
     e.stopPropagation();

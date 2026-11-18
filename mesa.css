@@ -375,3 +375,9 @@ body.con-mesa .mobile-dock,body.con-mesa .mobile-sheet-backdrop{display:none!imp
 .globo-herr.ver{opacity:1;transform:none}
 .globo-herr::before{content:"";position:absolute;left:-6px;top:50%;margin-top:-5px;border:5px solid transparent;border-right-color:#4aa8ff;border-left:0}
 .globo-herr[data-lado=arr]::before{left:50%;top:auto;bottom:-6px;margin:0 0 0 -5px;border:5px solid transparent;border-top-color:#4aa8ff;border-bottom:0}
+
+/* Círculo del pincel (Bisturí libre: Añadir / Quitar) */
+.anillo-pincel{position:absolute;left:0;top:0;z-index:7;pointer-events:none;border-radius:50%;border:2px solid #ffd23f;background:#ffd23f22;box-shadow:0 0 0 1.5px #0009,inset 0 0 0 1.5px #0009;will-change:transform}
+.anillo-pincel::after{content:"";position:absolute;left:50%;top:50%;width:4px;height:4px;margin:-2px;border-radius:50%;background:#ffd23f;box-shadow:0 0 0 1px #000a}
+.anillo-pincel.quitar{border-color:#ff6b6b;background:#ff6b6b22}
+.anillo-pincel.quitar::after{background:#ff6b6b}

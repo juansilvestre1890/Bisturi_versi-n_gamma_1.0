@@ -277,6 +277,7 @@ export function setupSeparacionInteligente(ctx) {
   }
 
   function pintarChips() {
+    if (!estado?.herr) window.bisturiPincel?.ocultar();
     const host = q('.si-piezas'); host.replaceChildren();
     const usadas = new Set(estado.etiquetas);
     for (let i = 0; i < estado.total; i++) {
@@ -448,7 +449,7 @@ export function setupSeparacionInteligente(ctx) {
     ray.setFromCamera(ndc, camera);
     const h = ray.intersectObject(estado.target, false)[0];
     if (!h || h.faceIndex == null) return null;
-    const f = estado.inv[h.faceIndex]; return f >= 0 ? { f, punto: h.point } : null;
+    const f = estado.inv[h.faceIndex]; return f >= 0 ? { f, punto: h.point, normal: h.face ? h.face.normal.clone().transformDirection(h.object.matrixWorld) : null } : null;
   }
   // Quitar con un color elegido: solo cambia las caras de ese color (pasan a «Objeto 1»).
   function pincelQuitar(topo, cent, mask, f0, punto, radio, L) {
@@ -469,6 +470,7 @@ export function setupSeparacionInteligente(ctx) {
     const g = golpe(e); if (!g || !estado.herr) return;
     const radio = estado.diag * Number(q('.si-tam input').value) / 100;
     const quitar = estado.herr === 'quitar', L = estado.activa;
+    window.bisturiPincel?.mostrar(e, g.punto, radio, g.normal, quitar);
     const cambiadas = quitar && L !== null ? pincelQuitar(estado.topo, estado.cent, estado.etiquetas, g.f, g.punto.toArray(), radio, L)
       : pincel(estado.topo, estado.cent, estado.etiquetas, g.f, g.punto.toArray(), radio, quitar ? 0 : L);
     if (cambiadas.length) { colorear(cambiadas); estado.cambios = true; estado.version = (estado.version || 0) + 1; }
@@ -528,13 +530,23 @@ export function setupSeparacionInteligente(ctx) {
     if (e.button !== 0) return;
     espera = { id: e.pointerId, x: e.clientX, y: e.clientY, t: performance.now(), e };
   }, { capture: true });
+  // Pincel encendido sin pulsar (ratón o lápiz): se ve el área que marcará.
+  const vistaPincel = e => {
+    if (!estado || !pintando() || e.pointerType === 'touch' || e.buttons || trazo != null || e.target !== lienzo) return;
+    const g = golpe(e);
+    if (g) window.bisturiPincel?.mostrar(e, g.punto, estado.diag * Number(q('.si-tam input').value) / 100, g.normal, estado.herr === 'quitar');
+    else window.bisturiPincel?.ocultar();
+  };
+  lienzo.addEventListener('pointerleave', () => { if (trazo == null) window.bisturiPincel?.ocultar(); });
   caja.addEventListener('pointermove', e => {
+    vistaPincel(e);
     if (!estado || dedos.size > 1) return;
     if (espera && espera.id === e.pointerId && (performance.now() - espera.t > 90 || Math.hypot(e.clientX - espera.x, e.clientY - espera.y) > 8)) { trazo = espera.id; pintar(espera.e); espera = null; }
     if (trazo === e.pointerId) pintar(e);
   }, { capture: true });
   const fin = e => {
     dedos.delete(e.pointerId);
+    if (e.pointerType === 'touch') window.bisturiPincel?.ocultar(900);
     if (espera && espera.id === e.pointerId) { espera = null; if (pintando()) toque(e); return; } // un toque pinta; dos toques seguidos deseleccionan
     if (trazo !== e.pointerId) return; trazo = null;
     if (estado) pintarChips();
@@ -598,7 +610,7 @@ export function setupSeparacionInteligente(ctx) {
     const { vista, target } = estado;
     quitarMalla(vista); scene.remove(vista); vista.geometry.dispose(); vista.material.dispose();
     if (ctx.meshes.includes(target)) target.visible = true;
-    estado = null; trazo = null; orbit.enabled = true; modoPintar(false);
+    estado = null; trazo = null; orbit.enabled = true; modoPintar(false); window.bisturiPincel?.ocultar();
     barra.hidden = true; barraProf.hidden = true; $('hInteligente')?.classList.remove('activo'); ctx.onActivo?.(false);
   }
   async function ejecutar() {

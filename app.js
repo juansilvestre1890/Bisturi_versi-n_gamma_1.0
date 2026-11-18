@@ -26,10 +26,10 @@ import {recoverBedLayout,assertBedLayoutRoundTrip} from './bed-project-roundtrip
 import {bedViewTransition,captureBedPlacementState} from './bed-view-switch.js';
 import {sliceMeshByWorldPlane} from './plane-cut.js';
 import {setupCortePlano} from './corte-plano.js?v=20261113m';
-import {setupSeparacionInteligente} from './separacion-inteligente.js?v=20261117a';
+import {setupSeparacionInteligente} from './separacion-inteligente.js?v=20261120c';
 import {setupBisturiMagnetico} from './bisturi-magnetico.js?v=20261117a';
 import {setupBisturiCurvo} from './bisturi-curvo.js?v=20261117g';
-import {setupBisturi} from './bisturi-herramientas.js?v=20261119h';
+import {setupBisturi} from './bisturi-herramientas.js?v=20261120b';
 import {repararUnionesT} from './mesh-tjunction.js?v=20261108o';
 import {cruzaCuadrado,pegarFuera} from './plano-finito.js?v=20261108p';
 import {detectarZona} from './bisturi-auto.js?v=20261108o';
@@ -294,6 +294,7 @@ function cancelSurfaceWork(){surfaceSelector.cancel();if(surfaceDrag){try{render
 function surfaceRaycast(e){accelerateSurfaceMeshes(meshes);ray.firstHitOnly=true;const rect=renderer.domElement.getBoundingClientRect();pointer.set((e.clientX-rect.left)/rect.width*2-1,-(e.clientY-rect.top)/rect.height*2+1);ray.setFromCamera(pointer,camera);return ray.intersectObjects(meshes.filter(m=>m.visible),false)[0]}
 function surfacePaint(e,knownHit=null){
  if(surfacePreview)clearSurfacePreview();const hit=knownHit||surfaceRaycast(e);if(!hit||!hit.object.isMesh)return;
+ if(tool==='Pincel')bisturiPincel.mostrar(e,hit.point,Number($('brushRadius').value),normalMundo(hit),$('brushErase').checked);
  selected=hit.object;updateList();const direction=camera.getWorldPosition(new THREE.Vector3()).sub(hit.point).normalize();
  const kind=tool==='Pincel'?'brush':tool==='Varita'?'wand':'magnetic';
  surfaceSelector.paint(hit,{kind,radius:Number($('brushRadius').value),tolerance:Number($(kind==='wand'?'wandTolerance':'magneticColor').value)/100,angle:Number($('magneticAngle').value),reach:Number($('magneticReach').value),cameraDirection:direction.toArray(),erase:$('brushErase').checked},surfaceDrag.stroke);
@@ -314,6 +315,9 @@ renderer.domElement.addEventListener('pointerdown',e=>{
  surfaceDrag={id:e.pointerId,x:e.clientX,y:e.clientY,x0:e.clientX,y0:e.clientY,t0:ahora,mesh:hit.object,antes:new Set(surfaceSet(hit.object)),stroke:{saved:false}};
  orbit.enabled=false;renderer.domElement.setPointerCapture(e.pointerId);surfacePaint(e,hit);
 },true);
+// Pincel sin pulsar (ratón o lápiz cerca de la pantalla): se ve el área antes de marcar.
+renderer.domElement.addEventListener('pointermove',e=>{if(surfaceDrag||tool!=='Pincel'||bedMode||e.pointerType==='touch'||e.buttons)return;const hit=surfaceRaycast(e);if(hit&&!explode&&!xray)bisturiPincel.mostrar(e,hit.point,Number($('brushRadius').value),normalMundo(hit),$('brushErase').checked);else bisturiPincel.ocultar()});
+renderer.domElement.addEventListener('pointerleave',()=>{if(!surfaceDrag)bisturiPincel.ocultar()});
 renderer.domElement.addEventListener('pointermove',e=>{if(!surfaceDrag||surfaceDrag.id!==e.pointerId)return;e.preventDefault();e.stopImmediatePropagation();if(tool==='Pincel'&&Math.hypot(e.clientX-surfaceDrag.x,e.clientY-surfaceDrag.y)>5){surfaceDrag.x=e.clientX;surfaceDrag.y=e.clientY;surfacePaint(e)}},true);
 let ultimoToquePincel=null;
 // Quita de la selección la zona conectada (por aristas) que contiene la cara tocada.
@@ -327,7 +331,7 @@ function quitarZonaSeleccion(mesh,f0){
  for(const f of zona)sel.delete(f);
  status(`Zona deseleccionada (${zona.length} caras).`);
 }
-function stopSurfaceStroke(e){if(!surfaceDrag||surfaceDrag.id!==e.pointerId)return;if(tool==='Pincel'&&Math.hypot(e.clientX-surfaceDrag.x0,e.clientY-surfaceDrag.y0)<8&&e.timeStamp-surfaceDrag.t0<500)ultimoToquePincel={t:e.timeStamp,x:e.clientX,y:e.clientY,mesh:surfaceDrag.mesh,antes:surfaceDrag.antes};else ultimoToquePincel=null;e.preventDefault();e.stopImmediatePropagation();try{renderer.domElement.releasePointerCapture(e.pointerId)}catch(_){}surfaceDrag=null;orbit.enabled=true;}
+function stopSurfaceStroke(e){if(!surfaceDrag||surfaceDrag.id!==e.pointerId)return;if(e.pointerType==='touch')bisturiPincel.ocultar(900);if(tool==='Pincel'&&Math.hypot(e.clientX-surfaceDrag.x0,e.clientY-surfaceDrag.y0)<8&&e.timeStamp-surfaceDrag.t0<500)ultimoToquePincel={t:e.timeStamp,x:e.clientX,y:e.clientY,mesh:surfaceDrag.mesh,antes:surfaceDrag.antes};else ultimoToquePincel=null;e.preventDefault();e.stopImmediatePropagation();try{renderer.domElement.releasePointerCapture(e.pointerId)}catch(_){}surfaceDrag=null;orbit.enabled=true;}
 renderer.domElement.addEventListener('pointerup',stopSurfaceStroke,true);renderer.domElement.addEventListener('pointercancel',e=>{if(surfaceDrag?.id===e.pointerId){stopSurfaceStroke(e);surfaceSelector.cancel();status('Trazo interrumpido; se conserva lo marcado. Usa «Deshacer» para revertirlo.')}},true);
 function setSurfaceTool(t){if(surfacePreview)clearSurfacePreview();if(touchPlaneActive){touchPlaneActive=false;planeDrag=null;syncPlaneTouchUI();setGuide(false);}if(pegTouchActive)disablePegTouch();setTool(t);$('brushTool').classList.toggle('active',t==='Pincel');$('wandTool').classList.toggle('active',t==='Varita');$('magneticTool').classList.toggle('active',t==='Magnético');status(t==='Pincel'?'Pincel activo: toca o arrastra sobre la malla.':t==='Varita'?'Varita activa: toca una región de color.':'Magnético activo: toca una región; la selección seguirá bordes de forma y color.')}
 $('brushTool').onclick=()=>setSurfaceTool('Pincel');$('wandTool').onclick=()=>setSurfaceTool('Varita');$('magneticTool').onclick=()=>setSurfaceTool('Magnético');
@@ -741,7 +745,7 @@ function loadPebbleExample(){
 $('demoMushroomBtn').onclick=loadMushroomExample;$('demoPebbleBtn').onclick=loadPebbleExample;
 $('scaleBtn').onclick=()=>{if(!modelLoaded)return status('Primero carga un modelo.');const h=Number($('height').value);if(!Number.isFinite(h)||h<=0)return status('Introduce una altura válida en centímetros.');const box=new THREE.Box3().setFromObject(root),size=box.getSize(new THREE.Vector3());if(size.y<=0)return status('El modelo no tiene altura válida.');save();root.scale.multiplyScalar(h*10/size.y);fit();updateStats();status(`Altura ajustada proporcionalmente a ${h} cm (asumiendo unidades del modelo en mm).`)};
 document.querySelectorAll('.mode').forEach(b=>b.onclick=()=>{mode=b.dataset.mode;document.querySelectorAll('.mode').forEach(x=>x.classList.toggle('active',x===b));updateStats();status('Modo '+mode+': las operaciones de segmentación se añadirán en próximas versiones.')});
-function setTool(t){if(surfaceSelector.busy())cancelSurfaceWork();if(bedMode){leaveBed();}tool=t;(transform.detach(),gizmoTarget=null);if(t==='Mover'&&selected&&!explode)attachGizmo(selected);if(t==='Mover'&&explode)status('Reúne las piezas antes de moverlas para conservar su posición real.');$('selectTool').classList.toggle('active',t==='Seleccionar');$('moveTool').classList.toggle('active',t==='Mover');$('brushTool').classList.toggle('active',t==='Pincel');$('wandTool').classList.toggle('active',t==='Varita');updateStats()}
+function setTool(t){if(t!=='Pincel')bisturiPincel.ocultar();if(surfaceSelector.busy())cancelSurfaceWork();if(bedMode){leaveBed();}tool=t;(transform.detach(),gizmoTarget=null);if(t==='Mover'&&selected&&!explode)attachGizmo(selected);if(t==='Mover'&&explode)status('Reúne las piezas antes de moverlas para conservar su posición real.');$('selectTool').classList.toggle('active',t==='Seleccionar');$('moveTool').classList.toggle('active',t==='Mover');$('brushTool').classList.toggle('active',t==='Pincel');$('wandTool').classList.toggle('active',t==='Varita');updateStats()}
 $('selectTool').onclick=()=>setTool('Seleccionar');$('moveTool').onclick=()=>setTool('Mover');transform.addEventListener('mouseDown',()=>save());let statsQueued=false;
 transform.addEventListener('objectChange',()=>{dirty=true;if(!statsQueued){statsQueued=true;requestAnimationFrame(()=>{statsQueued=false;updateStats();});}});
 // Resolución adaptable: mientras se gira la vista o se mueve una pieza se dibuja con menos píxeles.
@@ -757,6 +761,30 @@ orbit.addEventListener('start',interactionStart);orbit.addEventListener('end',in
 orbit.addEventListener('start',()=>window.dispatchEvent(new CustomEvent('bisturi-navegar',{detail:true})));orbit.addEventListener('end',()=>window.dispatchEvent(new CustomEvent('bisturi-navegar',{detail:false})));
 // Indicador 3D de navegación: dos aros con flechas (rojo horizontal, verde vertical) donde está el puntero.
 // Está fijo en el mundo, así que al girar la vista se ve girar en 3D; siempre del mismo tamaño en pantalla.
+// Vista previa de los pinceles: círculo en pantalla (siempre visible, aunque el dedo tape el centro)
+// y un disco sobre la superficie con el área que se va a marcar. Lo usan el Pincel de selección y la Separación inteligente.
+window.bisturiPincel=(()=>{
+  const caja=renderer.domElement.parentElement,anillo=document.createElement('div');anillo.className='anillo-pincel';anillo.hidden=true;caja.append(anillo);
+  const disco=new THREE.Mesh(new THREE.CircleGeometry(1,48),new THREE.MeshBasicMaterial({color:0xffd23f,transparent:true,opacity:.42,side:THREE.DoubleSide,depthWrite:false,polygonOffset:true,polygonOffsetFactor:-4,polygonOffsetUnits:-4}));
+  disco.visible=false;disco.renderOrder=26;disco.raycast=()=>{};scene.add(disco);
+  const Z=new THREE.Vector3(0,0,1);let espera=0;
+  // píxeles de pantalla que ocupa una longitud del mundo a la distancia de ese punto
+  const pxPorUnidad=p=>{const h=renderer.domElement.clientHeight||600;return camera.isPerspectiveCamera?h/(2*camera.position.distanceTo(p)*Math.tan(camera.fov*Math.PI/360)):h*camera.zoom/(camera.top-camera.bottom)};
+  return{
+    mostrar(e,punto,radio,normal,quitar=false){
+      clearTimeout(espera);
+      const rc=caja.getBoundingClientRect(),rp=Math.max(6,Math.min(400,radio*pxPorUnidad(punto)));
+      anillo.style.width=anillo.style.height=2*rp+'px';anillo.style.transform=`translate(${e.clientX-rc.left-rp}px,${e.clientY-rc.top-rp}px)`;
+      anillo.classList.toggle('quitar',!!quitar);anillo.hidden=false;
+      disco.material.color.set(quitar?0xff6b6b:0xffd23f);disco.position.copy(punto);disco.scale.setScalar(radio);
+      if(normal)disco.quaternion.setFromUnitVectors(Z,normal.clone().normalize());else disco.quaternion.copy(camera.quaternion);
+      disco.visible=true;window.bisturiRedibujar?.();
+    },
+    ocultar(ms=0){clearTimeout(espera);espera=setTimeout(()=>{anillo.hidden=true;disco.visible=false;window.bisturiRedibujar?.()},ms)}
+  };
+})();
+// normal de la cara tocada, en coordenadas del mundo
+const normalMundo=h=>h?.face?h.face.normal.clone().transformDirection(h.object.matrixWorld):null;
 const gizmoNav=(()=>{
   const g=new THREE.Group();g.visible=false;
   const mat=c=>new THREE.MeshPhysicalMaterial({color:c,emissive:c,emissiveIntensity:.18,roughness:.12,metalness:0,clearcoat:1,clearcoatRoughness:.1,transparent:true,opacity:0,side:THREE.DoubleSide,depthTest:false,depthWrite:false});
