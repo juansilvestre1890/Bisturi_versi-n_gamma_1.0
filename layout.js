@@ -197,9 +197,10 @@ function montar() {
   // En algunas tabletas y vistas dentro de otras apps, el selector de archivos solo se abre si el dedo toca
   // directamente un <input type="file">. Por eso cada botón «Abrir» lleva encima un selector invisible;
   // lo elegido se pasa al selector principal como si se hubiera usado ese.
+  // Con «accept» Android abre el gestor de archivos (no solo cámara y galería).
   for (const id of ['openBtn', 'inicioAbrir']) {
     const b = $(id); if (!b) continue;
-    const sobre = document.createElement('input'); sobre.type = 'file'; sobre.multiple = true; sobre.className = 'archivo-sobre'; sobre.tabIndex = -1; sobre.setAttribute('aria-hidden', 'true');
+    const sobre = document.createElement('input'); sobre.type = 'file'; sobre.multiple = true; sobre.accept = $('file').accept; sobre.className = 'archivo-sobre'; sobre.tabIndex = -1; sobre.setAttribute('aria-hidden', 'true');
     sobre.addEventListener('click', e => e.stopPropagation());
     sobre.addEventListener('change', () => {
       if (!sobre.files?.length) return;
