@@ -198,10 +198,26 @@ function montar() {
   // directamente un <input type="file">. Por eso cada botón «Abrir» lleva encima un selector invisible;
   // lo elegido se pasa al selector principal como si se hubiera usado ese.
   // Con «accept» Android abre el gestor de archivos (no solo cámara y galería).
+  // Solo en la página principal: dentro de un marco (como la vista previa de Claude) Chrome no deja abrir
+  // el gestor del sistema y se usa el selector normal.
+  let enMarco = true; try { enMarco = window.self !== window.top; } catch (_) {}
+  let usarSelectorSistema = /Android/i.test(navigator.userAgent) && typeof window.showOpenFilePicker === 'function' && !enMarco;
   for (const id of ['openBtn', 'inicioAbrir']) {
     const b = $(id); if (!b) continue;
     const sobre = document.createElement('input'); sobre.type = 'file'; sobre.multiple = true; sobre.accept = $('file').accept; sobre.className = 'archivo-sobre'; sobre.tabIndex = -1; sobre.setAttribute('aria-hidden', 'true');
-    sobre.addEventListener('click', e => e.stopPropagation());
+    sobre.addEventListener('click', e => {
+      e.stopPropagation();
+      // Android (Chrome 132+): se abre directamente el gestor de archivos del sistema («Archivos»),
+      // en lugar del menú de Chrome que en algunas tablets solo ofrece cámara y galería.
+      if (!usarSelectorSistema) return;
+      e.preventDefault();
+      window.showOpenFilePicker({ multiple: true }).then(async manejadores => {
+        const archivos = await Promise.all(manejadores.map(h => h.getFile()));
+        if (!archivos.length) return;
+        const principal = $('file'), dt = new DataTransfer(); archivos.forEach(f => dt.items.add(f));
+        principal.files = dt.files; principal.dispatchEvent(new Event('change', { bubbles: true }));
+      }).catch(err => { if (err?.name !== 'AbortError') { console.warn('Selector del sistema:', err); usarSelectorSistema = false; const st = $('status'); if (st) st.textContent = 'No se pudo abrir el gestor de archivos: toca «Abrir» otra vez.'; } });
+    });
     sobre.addEventListener('change', () => {
       if (!sobre.files?.length) return;
       const principal = $('file');
