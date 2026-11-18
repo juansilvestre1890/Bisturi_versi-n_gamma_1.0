@@ -332,10 +332,10 @@ body.con-mesa .mobile-dock,body.con-mesa .mobile-sheet-backdrop{display:none!imp
 .menu-vista .ico-img{--t:26px}
 /* Puntero de la herramienta activa (sigue al ratón o al dedo sobre la vista) */
 .puntero-herr{position:absolute;left:0;top:0;z-index:8;pointer-events:none;width:34px;height:34px;display:grid;place-items:center;color:#eaf4ff;filter:drop-shadow(0 0 1.5px #000) drop-shadow(0 2px 3px #000c);transition:opacity .25s}
-.puntero-herr .ico-img{--t:30px}
+.puntero-herr .ico-img{--t:34px}
 .puntero-herr .ico{width:26px;height:26px}
-.puntero-herr.tactil{width:42px;height:42px}
-.puntero-herr.tactil .ico-img{--t:32px}
+.puntero-herr.tactil{width:44px;height:44px}
+.puntero-herr.tactil .ico-img{--t:44px}
 .puntero-herr.fuera{opacity:0}
 @media (prefers-reduced-motion:reduce){.puntero-herr{transition:none}}
 /* Mientras se navega, el icono de la herramienta se aparta (sale el indicador 3D en la vista) */
@@ -365,3 +365,13 @@ body.con-mesa .mobile-dock,body.con-mesa .mobile-sheet-backdrop{display:none!imp
 .archivo-oculto{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden;clip:rect(0 0 0 0);pointer-events:none}
 .con-archivo{position:relative;overflow:hidden}
 .archivo-sobre{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer;font-size:200px;z-index:2}
+
+/* Sobre la vista no hay otro puntero: solo el icono de la herramienta */
+#viewport canvas{cursor:none!important}
+
+/* Globo con el nombre de la herramienta al pasar el puntero */
+.globo-herr{position:fixed;z-index:60;pointer-events:none;padding:6px 11px;border-radius:8px;background:#0b2a55f2;border:1px solid #4aa8ff;color:#eaf4ff;font:700 13px/1.2 system-ui,sans-serif;white-space:nowrap;box-shadow:0 6px 18px #0008;opacity:0;transform:translateX(-4px);transition:opacity .12s,transform .12s}
+.globo-herr[data-lado=arr]{transform:translateY(4px)}
+.globo-herr.ver{opacity:1;transform:none}
+.globo-herr::before{content:"";position:absolute;left:-6px;top:50%;margin-top:-5px;border:5px solid transparent;border-right-color:#4aa8ff;border-left:0}
+.globo-herr[data-lado=arr]::before{left:50%;top:auto;bottom:-6px;margin:0 0 0 -5px;border:5px solid transparent;border-top-color:#4aa8ff;border-bottom:0}

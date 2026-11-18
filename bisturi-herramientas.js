@@ -167,7 +167,8 @@ export function setupBisturi(ctx) {
     }
     d = { P, tri, n, cent, nrm, adj }; cacheMalla.set(g, d); return d;
   }
-  const verZona = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({ color: 0x2ee67a, transparent: true, opacity: .5, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }));
+  // La zona se pinta sobre la pieza como su propio color (opaca e iluminada), no transparente.
+  const verZona = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial({ color: 0x2ee67a, emissive: 0x0b4a24, roughness: .55, metalness: 0, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }));
   verZona.matrixAutoUpdate = false; verZona.visible = false; verZona.renderOrder = 25; verZona.raycast = () => {}; scene.add(verZona);
   const cuentaZona = () => zona ? zona.caras.reduce((s, x) => s + x, 0) : 0;
   function zonaValida() { if (ctx.enVista) return !!zona; // durante la vista previa la pieza está cortada de forma provisional
@@ -178,7 +179,7 @@ export function setupBisturi(ctx) {
     if (!zona || !n) { verZona.visible = false; actualizarBarraLibre(); return; }
     const d = datosMalla(zona.target), pos = new Float32Array(n * 9); let k = 0;
     for (let f = 0; f < d.n; f++) if (zona.caras[f]) for (let j = 0; j < 3; j++) { const v = 3 * d.tri[3 * f + j]; pos[k++] = d.P[v]; pos[k++] = d.P[v + 1]; pos[k++] = d.P[v + 2]; }
-    verZona.geometry.dispose(); verZona.geometry = new THREE.BufferGeometry(); verZona.geometry.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    verZona.geometry.dispose(); verZona.geometry = new THREE.BufferGeometry(); verZona.geometry.setAttribute('position', new THREE.BufferAttribute(pos, 3)); verZona.geometry.computeVertexNormals();
     zona.target.updateWorldMatrix(true, false); verZona.matrix.copy(zona.target.matrixWorld); verZona.matrixWorldNeedsUpdate = true; verZona.visible = !ctx.enVista;
     actualizarBarraLibre();
   }
@@ -216,20 +217,40 @@ export function setupBisturi(ctx) {
     return caras;
   }
   // «Añadir» / «Quitar»: pincel sobre la zona.
-  function pintarZona(e) {
+  // Caras que abarca el pincel en ese punto (radio de 22 px en pantalla).
+  function carasPincel(e) {
     const lista = zonaValida() ? [zona.target] : ctx.meshes.filter(m => m.visible && !m.userData.bisturiAlignmentPin);
-    const h = rayo(punto(e)).intersectObjects(lista, false)[0]; if (!h || h.faceIndex == null) return;
-    if (!zona) { if (pincelZona === 'quitar') return; zona = { target: h.object, geo: h.object.geometry, caras: new Uint8Array(datosMalla(h.object).n) }; }
-    const d = datosMalla(zona.target), M = zona.target.matrixWorld, pl = h.point.clone().applyMatrix4(M.clone().invert());
-    const r = lienzo.getBoundingClientRect(), dist = camera.position.distanceTo(h.point), escala = new THREE.Vector3(); zona.target.getWorldScale(escala);
+    const h = rayo(punto(e)).intersectObjects(lista, false)[0]; if (!h || h.faceIndex == null) return null;
+    const objetivo = h.object, d = datosMalla(objetivo), M = objetivo.matrixWorld, pl = h.point.clone().applyMatrix4(M.clone().invert());
+    const r = lienzo.getBoundingClientRect(), dist = camera.position.distanceTo(h.point), escala = new THREE.Vector3(); objetivo.getWorldScale(escala);
     const R = (camera.isPerspectiveCamera ? 2 * dist * Math.tan(camera.fov * Math.PI / 360) / r.height : (camera.top - camera.bottom) / camera.zoom / r.height) * 22 / ((escala.x + escala.y + escala.z) / 3), R2 = R * R;
-    const valor = pincelZona === 'quitar' ? 0 : 1, visto = new Set([h.faceIndex]), pila = [h.faceIndex];
+    const visto = new Set([h.faceIndex]), pila = [h.faceIndex], caras = [];
     while (pila.length) {
-      const f = pila.pop(); zona.caras[f] = valor;
+      const f = pila.pop(); caras.push(f);
       for (const g of d.adj[f]) { if (visto.has(g)) continue; visto.add(g); const dx = d.cent[3 * g] - pl.x, dy = d.cent[3 * g + 1] - pl.y, dz = d.cent[3 * g + 2] - pl.z; if (dx * dx + dy * dy + dz * dz <= R2) pila.push(g); }
     }
-    dibujarZona();
+    return { objetivo, caras };
   }
+  function pintarZona(e) {
+    const c = carasPincel(e); if (!c) return;
+    if (!zona) { if (pincelZona === 'quitar') return; zona = { target: c.objetivo, geo: c.objetivo.geometry, caras: new Uint8Array(datosMalla(c.objetivo).n) }; }
+    const valor = pincelZona === 'quitar' ? 0 : 1; for (const f of c.caras) zona.caras[f] = valor;
+    dibujarZona(); sombraPincel(e);
+  }
+  // Sombra del pincel: oscurece lo que abarcará antes de pintar (y mientras se pinta).
+  const sombra = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: .38, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 }));
+  sombra.matrixAutoUpdate = false; sombra.visible = false; sombra.renderOrder = 26; sombra.raycast = () => {}; scene.add(sombra);
+  let sombraT = 0;
+  function sombraPincel(e) {
+    clearTimeout(sombraT);
+    const c = modo === 'libre' && pincelZona && !ctx.enVista ? carasPincel(e) : null;
+    if (!c) { sombra.visible = false; return; }
+    const d = datosMalla(c.objetivo), pos = new Float32Array(c.caras.length * 9); let k = 0;
+    for (const f of c.caras) for (let j = 0; j < 3; j++) { const v = 3 * d.tri[3 * f + j]; pos[k++] = d.P[v]; pos[k++] = d.P[v + 1]; pos[k++] = d.P[v + 2]; }
+    sombra.geometry.dispose(); sombra.geometry = new THREE.BufferGeometry(); sombra.geometry.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    c.objetivo.updateWorldMatrix(true, false); sombra.matrix.copy(c.objetivo.matrixWorld); sombra.matrixWorldNeedsUpdate = true; sombra.visible = true;
+  }
+  const quitarSombra = (espera = 0) => { clearTimeout(sombraT); sombraT = setTimeout(() => { sombra.visible = false; }, espera); };
   const zonaPara = () => ({ modo: 'zona', caras: zona.caras, target: zona.target, geometria: zona.geo });
   // Vista previa (Demostración) del corte por la zona.
   const vistaLibre = ctx.vistaPorCorte(async () => { if (!zonaValida() || !cuentaZona()) return false; await ctx.applyFreeZone(zonaPara()); return true; });
@@ -262,6 +283,7 @@ export function setupBisturi(ctx) {
     bQuitar.hidden = bBorrarZona.hidden = bCortarZona.hidden = !hayZona;
     $('bisturiQuitarPunto').hidden = $('bisturiBorrarPuntos').hidden = $('bisturiCerrar').hidden = !nodos.length;
     lienzo.style.cursor = modo === 'libre' && pincelZona ? 'cell' : modo ? 'crosshair' : '';
+    if (modo !== 'libre' || !pincelZona) sombra.visible = false;
     if (modo === 'libre') $('bisturiLibreInfo').textContent = pincelZona ? (pincelZona === 'anadir' ? 'Añadir: pinta sobre la figura. Tócalo otra vez para dejar de pintar.' : 'Quitar: pinta sobre la zona verde. Tócalo otra vez para dejar de pintar.')
       : nodos.length ? $('bisturiLibreInfo').textContent
       : hayZona ? 'Zona verde lista. Puedes sumar otro contorno, corregir o «Hacer el corte».' : 'Toca alrededor de la zona para poner puntos, o usa «Añadir».';
@@ -431,17 +453,19 @@ export function setupBisturi(ctx) {
   }, { capture: true });
   caja.addEventListener('pointermove', e => {
     if (pintando === e.pointerId) { e.stopPropagation(); pintarZona(e); return; }
+    if (modo === 'libre' && pincelZona && e.pointerType === 'mouse' && e.target === lienzo && !e.buttons) sombraPincel(e);
     if (!modo || pasar || !trazo || e.pointerId !== primero.pointerId) return;
     const p = punto(e);
-    // Bisturí libre: arrastrar un dedo gira la vista (los puntos se ponen tocando).
-    if (modo === 'libre') { if (Math.hypot(p.x - trazo[0].x, p.y - trazo[0].y) > 10) cederVista(); else e.stopPropagation(); return; }
+    // Bisturí libre: un dedo nunca mueve la cámara (para girar o acercar se usan dos dedos o el botón derecho).
+    // Si el dedo se arrastra, al soltar no se pone punto.
+    if (modo === 'libre') { e.stopPropagation(); if (Math.hypot(p.x - trazo[0].x, p.y - trazo[0].y) > 12) trazo.arrastrado = true; return; }
     e.stopPropagation();
     trazo.push(p);
     dibujarTrazo([trazo[0], trazo[trazo.length - 1]], false);
   }, { capture: true });
   const fin = e => {
     activos.delete(e.pointerId);
-    if (pintando === e.pointerId) { pintando = null; e.stopPropagation(); try { caja.releasePointerCapture(e.pointerId); } catch (_) {} return; }
+    if (pintando === e.pointerId) { pintando = null; e.stopPropagation(); try { caja.releasePointerCapture(e.pointerId); } catch (_) {} if (e.pointerType !== 'mouse') quitarSombra(400); return; }
     if (pasar) { if (!activos.size) pasar = false; return; }
     if (!modo || !trazo || e.pointerId !== primero.pointerId) return;
     e.stopPropagation();
@@ -449,7 +473,7 @@ export function setupBisturi(ctx) {
     if (e.type === 'pointercancel') { if (modo === 'plano') limpiarCapa(); return; }
     const a = pts[0], b = pts[pts.length - 1];
     if (modo === 'plano') { limpiarCapa(); if (Math.hypot(b.x - a.x, b.y - a.y) < 12) return; crearPlano(a, b); }
-    else tocarNodo(a);
+    else if (!pts.arrastrado) tocarNodo(a);
   };
   caja.addEventListener('pointerup', fin, { capture: true });
   let toqueVista = null;
@@ -458,6 +482,7 @@ export function setupBisturi(ctx) {
     if (modo === 'plano' && ctx.enVista && Math.hypot(e.clientX - t.x, e.clientY - t.y) < 6) { ctx.cerrarVista(false); ctx.status('Modelo armado: dibuja la siguiente línea. La vista previa vuelve sola al crear el plano.'); }
   }, { capture: true });
   caja.addEventListener('pointercancel', fin, { capture: true });
+  lienzo.addEventListener('pointerleave', () => quitarSombra());
 
   // ---------- barras sobre la vista (en lugar del panel lateral) ----------
   // Abajo: los botones de la herramienta activa. Arriba (bisturí libre): profundidad y holgura.

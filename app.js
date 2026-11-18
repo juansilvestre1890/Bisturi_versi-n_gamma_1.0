@@ -29,7 +29,7 @@ import {setupCortePlano} from './corte-plano.js?v=20261113m';
 import {setupSeparacionInteligente} from './separacion-inteligente.js?v=20261117a';
 import {setupBisturiMagnetico} from './bisturi-magnetico.js?v=20261117a';
 import {setupBisturiCurvo} from './bisturi-curvo.js?v=20261117g';
-import {setupBisturi} from './bisturi-herramientas.js?v=20261116c';
+import {setupBisturi} from './bisturi-herramientas.js?v=20261119h';
 import {repararUnionesT} from './mesh-tjunction.js?v=20261108o';
 import {cruzaCuadrado,pegarFuera} from './plano-finito.js?v=20261108p';
 import {detectarZona} from './bisturi-auto.js?v=20261108o';
@@ -111,6 +111,8 @@ function attachGizmo(obj){gizmoTarget=obj;syncGizmoPivot();transform.attach(gizm
 transform.addEventListener('mouseDown',()=>syncGizmoPivot());
 transform.addEventListener('objectChange',()=>{
   if(!gizmoTarget||transform.object!==gizmoPivot)return;
+  // Escalar: siempre proporcional. Se toma el eje que más cambió y se aplica a los tres.
+  if(transform.mode==='scale'){const e=gizmoPivot.scale;let f=e.x;for(const c of [e.y,e.z])if(Math.abs(Math.log(Math.abs(c)||1e-6))>Math.abs(Math.log(Math.abs(f)||1e-6)))f=c;f=Math.max(Math.abs(f),1e-3);e.set(f,f,f)}
   gizmoPivot.updateMatrixWorld(true);
   // nueva matriz de la pieza = (pivote actual · pivote inicial⁻¹) · pieza inicial
   const delta=gizmoPivot.matrixWorld.clone().multiply(gizmoStart.pivot.clone().invert()),world=delta.multiply(gizmoStart.target);
@@ -743,10 +745,13 @@ function setTool(t){if(surfaceSelector.busy())cancelSurfaceWork();if(bedMode){le
 $('selectTool').onclick=()=>setTool('Seleccionar');$('moveTool').onclick=()=>setTool('Mover');transform.addEventListener('mouseDown',()=>save());let statsQueued=false;
 transform.addEventListener('objectChange',()=>{dirty=true;if(!statsQueued){statsQueued=true;requestAnimationFrame(()=>{statsQueued=false;updateStats();});}});
 // Resolución adaptable: mientras se gira la vista o se mueve una pieza se dibuja con menos píxeles.
-const fullPixelRatio=Math.min(devicePixelRatio,2);let lowResTimer=0;
+// En modelos grandes la resolución de reposo también se limita (las tabletas tienen hasta 3 píxeles por punto).
+const resolucionIdeal=()=>{const n=sceneTriangles();return Math.min(devicePixelRatio,n>1500000?1:n>600000?1.25:n>200000?1.5:2)};
+let lowResTimer=0,interactuando=false;
 function sceneTriangles(){let n=0;for(const m of meshes){const g=m.geometry;n+=(g.index?g.index.count:g.attributes.position.count)/3;}return n;}
-function interactionStart(){clearTimeout(lowResTimer);const n=sceneTriangles();if(n<150000)return;const low=n>1500000?.6:n>600000?.8:1;if(renderer.getPixelRatio()!==low){renderer.setPixelRatio(low);resize();}}
-function interactionEnd(){clearTimeout(lowResTimer);lowResTimer=setTimeout(()=>{if(renderer.getPixelRatio()!==fullPixelRatio){renderer.setPixelRatio(fullPixelRatio);resize();}},250);}
+function interactionStart(){interactuando=true;clearTimeout(lowResTimer);const n=sceneTriangles();if(n<150000)return;const low=n>1500000?.6:n>600000?.8:1;if(renderer.getPixelRatio()!==low){renderer.setPixelRatio(low);resize();}}
+function interactionEnd(){clearTimeout(lowResTimer);lowResTimer=setTimeout(()=>{interactuando=false;ajustarResolucion()},250);}
+function ajustarResolucion(){if(interactuando)return;const r=resolucionIdeal();if(renderer.getPixelRatio()!==r){renderer.setPixelRatio(r);resize();window.bisturiRedibujar?.()}}
 orbit.addEventListener('start',interactionStart);orbit.addEventListener('end',interactionEnd);
 // Navegación (girar, desplazar o acercar la cámara): la interfaz muestra el icono de navegar junto al puntero.
 orbit.addEventListener('start',()=>window.dispatchEvent(new CustomEvent('bisturi-navegar',{detail:true})));orbit.addEventListener('end',()=>window.dispatchEvent(new CustomEvent('bisturi-navegar',{detail:false})));
@@ -816,7 +821,7 @@ const gizmoNav=(()=>{
     prev=c;
   }
   let opacidad=0;
-  return {actualizar(){
+  return {animando:()=>opacidad>.005||!!modo,actualizar(){
     clasificar();
     // Los aros 3D solo salen al GIRAR la vista (mover = mano, zoom = lupa).
     const meta=modo==='girar'?1:0;opacidad+=(meta-opacidad)*.25;if(Math.abs(meta-opacidad)<.01)opacidad=meta;
@@ -2193,20 +2198,52 @@ function setModoVista(m){
     status(t>600000?'Vista de malla: el modelo es muy grande, así que solo se dibujan las aristas marcadas además de los vértices.':'Vista de malla: se ven los vértices (amarillo), las aristas (celeste) y las caras.')}
   else status(m==='rayos'?'Vista Rayos X: las piezas se ven transparentes.':'Vista normal del objeto.');
 }
+// Las aristas de la malla se calculan por partes (unos milisegundos por cuadro) para que la app no se congele con modelos grandes.
+function* generarAristas(geo,soloMarcadas){
+  const pos=geo.getAttribute('position'),idx=geo.index,nt=(idx?idx.count:pos.count)/3,P=pos.array,st=pos.itemSize||3;
+  const vi=i=>idx?idx.getX(i):i;
+  // las STL repiten cada vértice por cara: se unen por posición
+  geo.computeBoundingBox();const tam=geo.boundingBox.getSize(new THREE.Vector3()).length()||1,q=1e5/tam;
+  const claves=new Map(),idV=new Int32Array(pos.count).fill(-1);let sig=0;
+  const clave=v=>{if(idV[v]>=0)return idV[v];const o=v*st,k=Math.round(P[o]*q)+','+Math.round(P[o+1]*q)+','+Math.round(P[o+2]*q);let id=claves.get(k);if(id===undefined){id=sig++;claves.set(k,id)}idV[v]=id;return id};
+  const N=soloMarcadas?new Float32Array(nt*3):null,cosLim=Math.cos(20*Math.PI/180),aristas=new Map(),salida=[];
+  const A=new THREE.Vector3(),B=new THREE.Vector3(),C=new THREE.Vector3(),n=new THREE.Vector3();
+  const empuja=(v1,v2)=>{const o1=v1*st,o2=v2*st;salida.push(P[o1],P[o1+1],P[o1+2],P[o2],P[o2+1],P[o2+2])};
+  let t0=performance.now();const pausa=t=>(t&1023)===0&&performance.now()-t0>8;
+  for(let t=0;t<nt;t++){
+    const v0=vi(t*3),v1=vi(t*3+1),v2=vi(t*3+2),vs=[v0,v1,v2],k=[clave(v0),clave(v1),clave(v2)];
+    if(N){A.fromBufferAttribute(pos,v0);B.fromBufferAttribute(pos,v1);C.fromBufferAttribute(pos,v2);n.subVectors(C,B).cross(A.sub(B)).normalize();N[t*3]=n.x;N[t*3+1]=n.y;N[t*3+2]=n.z}
+    for(let e=0;e<3;e++){
+      const a=k[e],b=k[(e+1)%3];if(a===b)continue;const ll=a<b?a*4294967296+b:b*4294967296+a,prev=aristas.get(ll);
+      if(prev===undefined){aristas.set(ll,t+1);continue}
+      if(prev===0)continue;aristas.set(ll,0);
+      if(!N){empuja(vs[e],vs[(e+1)%3]);continue}
+      const f=(prev-1)*3;if(N[f]*N[t*3]+N[f+1]*N[t*3+1]+N[f+2]*N[t*3+2]<=cosLim)empuja(vs[e],vs[(e+1)%3]);
+    }
+    if(pausa(t)){yield;t0=performance.now()}
+  }
+  // bordes abiertos: aristas con una sola cara
+  const caras=new Set();for(const x of aristas.values())if(x)caras.add(x-1);
+  for(const t of caras){const vs=[vi(t*3),vi(t*3+1),vi(t*3+2)];for(let e=0;e<3;e++){const a=idV[vs[e]],b=idV[vs[(e+1)%3]];if(a===b)continue;const ll=a<b?a*4294967296+b:b*4294967296+a;if(aristas.get(ll)===t+1){empuja(vs[e],vs[(e+1)%3]);aristas.set(ll,0)}}}
+  const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.Float32BufferAttribute(salida,3));return g;
+}
 function actualizarMalla(){
   if(!modoMalla){if(mallaVis.size){for(const v of mallaVis.values()){scene.remove(v.lineas,v.puntos);v.lineas.geometry.dispose()}mallaVis.clear()}return}
   for(const [m,v] of mallaVis)if(!meshes.includes(m)){scene.remove(v.lineas,v.puntos);v.lineas.geometry.dispose();mallaVis.delete(m)}
   let total=0;for(const x of meshes)total+=(x.geometry.index?x.geometry.index.count:x.geometry.attributes.position.count)/3;
+  const inicio=performance.now();
   for(const m of meshes){
     let v=mallaVis.get(m);
     if(!v||v.geo!==m.geometry){
       if(v){scene.remove(v.lineas,v.puntos);v.lineas.geometry.dispose()}
-      const g=total>600000?new THREE.EdgesGeometry(m.geometry,20):new THREE.WireframeGeometry(m.geometry);
       const pg=new THREE.BufferGeometry();pg.setAttribute('position',m.geometry.getAttribute('position'));
-      const lineas=new THREE.LineSegments(g,matAristas),puntos=new THREE.Points(pg,matVertices);
+      const lineas=new THREE.LineSegments(new THREE.BufferGeometry(),matAristas),puntos=new THREE.Points(pg,matVertices);
       for(const o of [lineas,puntos]){o.matrixAutoUpdate=false;o.raycast=()=>{};o.renderOrder=6;scene.add(o)}
-      v={geo:m.geometry,lineas,puntos};mallaVis.set(m,v);
+      v={geo:m.geometry,lineas,puntos,gen:generarAristas(m.geometry,total>600000)};mallaVis.set(m,v);
     }
+    // seguir calculando aristas pendientes, con un límite de tiempo por cuadro
+    if(v.gen&&performance.now()-inicio<10){const r=v.gen.next();if(r.done){v.lineas.geometry.dispose();v.lineas.geometry=r.value;v.gen=null}window.bisturiRedibujar?.(200)}
+    else if(v.gen)window.bisturiRedibujar?.(200);
     m.updateWorldMatrix(true,false);
     for(const o of [v.lineas,v.puntos]){o.matrix.copy(m.matrixWorld);o.matrixWorldNeedsUpdate=true;o.visible=m.visible&&!!m.parent&&m.parent.visible!==false}
   }
@@ -2222,9 +2259,20 @@ const marca={tinte:null,brillo:null,mesh:null,geo:null};
   for(const o of [tinte,brillo]){o.matrixAutoUpdate=false;o.visible=false;o.raycast=()=>{};o.renderOrder=4;scene.add(o)}
   marca.tinte=tinte;marca.brillo=brillo;
 }
+// En modelos grandes la pieza elegida no se dibuja tres veces (pieza + tinte + borde):
+// se le da un brillo azul en su propio material, que no cuesta nada.
+const brilloLigero=new Map();
+function quitarBrilloLigero(){for(const [mat,em] of brilloLigero){mat.emissive?.copy(em.c);if(mat.emissive)mat.emissiveIntensity=em.i}brilloLigero.clear()}
 function marcarSeleccion(){
   const m=selected&&meshes.includes(selected)&&selected.visible&&selected.parent?selected:null;
   const {tinte,brillo}=marca;
+  const grande=m&&((m.geometry.index?m.geometry.index.count:m.geometry.attributes.position.count)/3)>300000;
+  if(!grande&&brilloLigero.size)quitarBrilloLigero();
+  if(grande){tinte.visible=brillo.visible=false;marca.mesh=null;
+    const mats=Array.isArray(m.material)?m.material:[m.material];
+    if(![...brilloLigero.keys()].every(x=>mats.includes(x))||brilloLigero.size!==mats.filter(x=>x.emissive).length){quitarBrilloLigero();
+      for(const mat of mats)if(mat.emissive){brilloLigero.set(mat,{c:mat.emissive.clone(),i:mat.emissiveIntensity});mat.emissive.setHex(0x2a6fdb);mat.emissiveIntensity=.55}}
+    return}
   if(!m){tinte.visible=brillo.visible=false;marca.mesh=null;return}
   if(marca.mesh!==m||marca.geo!==m.geometry){
     marca.mesh=m;marca.geo=m.geometry;tinte.geometry=m.geometry;brillo.geometry=m.geometry;
@@ -2236,7 +2284,20 @@ function marcarSeleccion(){
   const sh=brillo.material.userData.sh;if(sh)sh.uniforms.grosor.value=marca.grosor;
   tinte.visible=brillo.visible=true;
 }
-function resize(){const w=viewport.clientWidth,h=viewport.clientHeight;if(w&&h){camera.aspect=w/h;camera.updateProjectionMatrix();renderer.setSize(w,h,false)}}new ResizeObserver(resize).observe(viewport);resize();renderer.setAnimationLoop(()=>{orbit.update();gizmoNav.actualizar();marcarSeleccion();actualizarMalla();if(gizmoTarget&&!transform.dragging){if(!meshes.includes(gizmoTarget)||!gizmoTarget.parent)(transform.detach(),gizmoTarget=null);else syncGizmoPivot();}renderer.render(scene,camera)});
+function resize(){const w=viewport.clientWidth,h=viewport.clientHeight;if(w&&h){camera.aspect=w/h;camera.updateProjectionMatrix();renderer.setSize(w,h,false)}}new ResizeObserver(resize).observe(viewport);resize();// Dibujo bajo demanda: la vista solo se vuelve a dibujar cuando algo cambia (tocar, girar, cortar, cargar…).
+// Quieta no gasta tarjeta gráfica ni batería; por seguridad se repinta una vez por segundo.
+let actividadHasta=0,ultimoDibujo=0;
+const avisarActividad=(ms=700)=>{actividadHasta=Math.max(actividadHasta,performance.now()+ms)};
+window.bisturiRedibujar=avisarActividad;
+for(const t of ['pointerdown','pointermove','pointerup','wheel','keydown','keyup','input','change'])window.addEventListener(t,()=>avisarActividad(),{capture:true,passive:true});
+window.addEventListener('resize',()=>avisarActividad());
+new MutationObserver(()=>avisarActividad(500)).observe(document.body,{subtree:true,childList:true,attributes:true,characterData:true});
+orbit.addEventListener('change',()=>avisarActividad(300));transform.addEventListener('change',()=>avisarActividad(300));
+let firmaRes=-1;
+renderer.setAnimationLoop(t=>{const movio=orbit.update();if(!interactuando){let f=meshes.length;for(const m of meshes)f+=m.geometry.attributes.position.count;if(f!==firmaRes){firmaRes=f;ajustarResolucion()}}gizmoNav.actualizar();marcarSeleccion();actualizarMalla();if(gizmoTarget&&!transform.dragging){if(!meshes.includes(gizmoTarget)||!gizmoTarget.parent)(transform.detach(),gizmoTarget=null);else syncGizmoPivot();}
+  const ahora=performance.now();
+  if(!movio&&ahora>actividadHasta&&!gizmoNav.animando()&&ahora-ultimoDibujo<1000)return;
+  ultimoDibujo=ahora;renderer.render(scene,camera)});
 
 // Interfaz de corte móvil: usa el mismo motor de corte del editor de escritorio.
 (function setupMobileCutUI(){

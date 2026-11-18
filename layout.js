@@ -348,6 +348,38 @@ function montar() {
   etiSalir.type = 'button'; etiSalir.className = 'herr-salir'; etiSalir.textContent = '✕'; etiSalir.setAttribute('aria-label', 'Salir de la herramienta');
   etiqueta.append(etiNombre, etiSalir); $('escenaVista').append(etiqueta);
   let etiBoton = null;
+  // Nombre de cada botón de la barra de herramientas al pasar el puntero por encima (ratón o lápiz).
+  {
+    const globo = document.createElement('div'); globo.className = 'globo-herr'; globo.hidden = true; globo.setAttribute('role', 'tooltip');
+    document.body.append(globo);
+    const nombreDe = b => {
+      const par = NOMBRES.find(([id]) => id === b.id); if (par) return par[1];
+      if (b.id === 'vRayosX') return 'Vista';
+      return (b.dataset.nombre || '').split(/ \(|:/)[0];
+    };
+    let actual = null;
+    const ocultar = () => { globo.hidden = true; globo.classList.remove('ver'); actual = null; };
+    for (const b of document.querySelectorAll('.barra-vertical button')) {
+      if (b.title) { b.dataset.nombre = b.title; if (!b.getAttribute('aria-label')) b.setAttribute('aria-label', b.title); b.removeAttribute('title'); }
+      b.addEventListener('pointerenter', e => {
+        if (e.pointerType === 'touch') return;
+        const n = nombreDe(b); if (!n) return;
+        actual = b; globo.textContent = n; globo.hidden = false;
+        const cont = document.fullscreenElement || document.body; if (globo.parentNode !== cont) cont.append(globo);
+        const r = b.getBoundingClientRect(), g = globo.getBoundingClientRect();
+        const fs = document.fullscreenElement?.getBoundingClientRect() || { left: 0, top: 0 };
+        let x = r.right + 10, y = r.top + r.height / 2 - g.height / 2, lado = 'der';
+        if (x + g.width > innerWidth - 8) { x = r.left + r.width / 2 - g.width / 2; y = r.top - g.height - 10; lado = 'arr'; }
+        globo.style.left = Math.max(8, Math.min(innerWidth - g.width - 8, x)) - fs.left + 'px';
+        globo.style.top = Math.max(8, y) - fs.top + 'px';
+        globo.dataset.lado = lado;
+        requestAnimationFrame(() => actual === b && globo.classList.add('ver'));
+      });
+      b.addEventListener('pointerleave', () => actual === b && ocultar());
+      b.addEventListener('pointerdown', ocultar);
+    }
+    addEventListener('scroll', ocultar, true);
+  }
   const actualizarEtiqueta = () => {
     const par = NOMBRES.find(([id]) => $(id)?.classList.contains('activo'));
     etiBoton = par ? $(par[0]) : null;
@@ -377,6 +409,8 @@ function montar() {
   const puntero = document.createElement('div'); puntero.className = 'puntero-herr'; puntero.hidden = true; puntero.setAttribute('aria-hidden', 'true');
   vistaEl.append(puntero);
   let punteroDe = null, punteroT = 0;
+  // Punta de cada icono (fracción del ancho y del alto), medida sobre las imágenes de la barra.
+  const PUNTA = { vSeleccionar: [.16, .06], vBisturi: [.08, .93], vBisturiLibre: [.15, .72], vBisturiMagnetico: [.30, .60], vBisturiCurvo: [.27, .60], hSeleccion: [.40, .73] };
   function iconoPuntero() {
     const b = etiBoton || $('vSeleccionar');
     if (b === punteroDe) return; punteroDe = b;
@@ -386,7 +420,10 @@ function montar() {
     if (!e.isPrimary || e.target !== lienzo3d()) { if (e.pointerType === 'mouse') puntero.hidden = true; return; }
     iconoPuntero();
     const r = vistaEl.getBoundingClientRect(), tactil = e.pointerType !== 'mouse';
-    const x = e.clientX - r.left + (tactil ? -52 : 16), y = e.clientY - r.top + (tactil ? -64 : 18);
+    // El icono ES el puntero: su punta (la hoja del bisturí, la punta del pincel, la flecha) queda
+    // exactamente donde está el ratón o el dedo. Las demás herramientas se centran en el punto.
+    const lado = tactil ? 44 : 34, h = PUNTA[punteroDe?.id] || [.5, .5];
+    const x = e.clientX - r.left - h[0] * lado, y = e.clientY - r.top - h[1] * lado;
     puntero.style.transform = `translate(${Math.round(x)}px, ${Math.round(y)}px)`;
     puntero.classList.toggle('tactil', tactil); puntero.classList.remove('fuera'); puntero.hidden = false;
     clearTimeout(punteroT);
