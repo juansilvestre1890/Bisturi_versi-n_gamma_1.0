@@ -680,7 +680,59 @@ function download(data,name,mime){
     setTimeout(()=>{a.remove();URL.revokeObjectURL(url)},30000);
   }
 }
-async function loadFile(files){if(!files?.length)return;let cleanup=()=>{},missingTextures=null;status('Leyendo archivos locales…');try{
+// Simplificación automática al abrir: los modelos muy pesados (escaneos, modelos hechos con IA) traen
+// muchos más triángulos de los que la impresora puede reproducir. Se unen triángulos donde la forma
+// casi no cambia, con un error máximo de media milésima del tamaño del modelo (menos de 0,1 mm en una figura de 15 cm).
+const SIMP_DESDE=300000,SIMP_TOLERANCIA=.0005,SIMP_MINIMO=80000;
+let trabajadorSimp=null,simpId=0;
+function simplificarGeometria(geo,objetivo,alAvanzar){
+ trabajadorSimp??=new Worker(new URL('./simplificador.js?v=20261120e',import.meta.url));
+ const id=++simpId,pos=geo.attributes.position,col=geo.attributes.color;
+ const P=new Float32Array(pos.count*3);for(let i=0;i<pos.count;i++){P[3*i]=pos.getX(i);P[3*i+1]=pos.getY(i);P[3*i+2]=pos.getZ(i)}
+ let C=null;if(col){C=new Float32Array(pos.count*3);for(let i=0;i<pos.count;i++){C[3*i]=col.getX(i);C[3*i+1]=col.getY(i);C[3*i+2]=col.getZ(i)}}
+ const I=geo.index?Uint32Array.from(geo.index.array):null;
+ return new Promise((ok,mal)=>{
+  const fin=()=>{trabajadorSimp.removeEventListener('message',oir);trabajadorSimp.removeEventListener('error',fallo)};
+  const oir=({data})=>{if(data.progreso!=null){alAvanzar?.(data.progreso);return}if(data.id!==id)return;fin();data.error?mal(Error(data.error)):ok(data)};
+  const fallo=e=>{fin();trabajadorSimp=null;mal(e)};
+  trabajadorSimp.addEventListener('message',oir);trabajadorSimp.addEventListener('error',fallo);
+  const tr=[P.buffer];if(I)tr.push(I.buffer);if(C)tr.push(C.buffer);
+  trabajadorSimp.postMessage({id,pos:P,idx:I,col:C,objetivo,tolerancia:SIMP_TOLERANCIA},tr);
+ });
+}
+async function simplificarAuto(object){
+ const lista=[];let total=0;
+ object.traverse(o=>{if(!o.isMesh||!o.geometry?.attributes?.position)return;const g=o.geometry,n=(g.index?g.index.count:g.attributes.position.count)/3;total+=n;
+  const mats=Array.isArray(o.material)?o.material:[o.material];
+  // se dejan como están: piezas con texturas (perderían su imagen), con varios materiales o animadas
+  const apta=!o.isSkinnedMesh&&!g.morphAttributes?.position&&!(g.groups?.length>1)&&!mats.some(m=>m?.map)&&n>2000;
+  if(apta)lista.push({o,n})});
+ if(total<SIMP_DESDE||!lista.length)return null;
+ const antes=total,t0=performance.now();let hechos=0,despues=total;
+ for(const {o,n} of lista){
+  try{
+   const r=await simplificarGeometria(o.geometry,Math.max(2000,Math.round(SIMP_MINIMO*n/total)),f=>status(`Optimizando el modelo para que la app vaya rápida… ${Math.round((hechos+f)/lista.length*100)} %`));
+   if(r.despues>=n*.95){hechos++;continue}
+   let g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.BufferAttribute(r.pos,3));if(r.col)g.setAttribute('color',new THREE.BufferAttribute(r.col,3));g.setIndex(new THREE.BufferAttribute(r.idx,1));
+   if(!o.geometry.index){const ng=g.toNonIndexed();g.dispose();g=ng} // las STL siguen como STL: una cara, tres vértices
+   g.computeVertexNormals();g.name=o.geometry.name;o.geometry.dispose();o.geometry=g;despues+=r.despues-n;
+  }catch(e){console.warn('No se pudo simplificar',o.name,e)}
+  hechos++;
+ }
+ if(despues>=antes*.95)return null;
+ return {antes,despues,ms:performance.now()-t0};
+}
+function avisoSimplificado({antes,despues},files){
+ document.querySelector('.aviso-simp')?.remove();
+ const fmt=n=>Math.round(n).toLocaleString('es');
+ const a=document.createElement('div');a.className='aviso aviso-simp';a.setAttribute('role','status');
+ a.innerHTML=`<span>Modelo optimizado: <b>${fmt(antes)}</b> → <b>${fmt(despues)}</b> triángulos, sin cambios visibles al imprimir.</span><button type="button" class="aviso-orig">Usar original</button><button type="button" class="aviso-cerrar" aria-label="Cerrar aviso">×</button>`;
+ a.querySelector('.aviso-cerrar').onclick=()=>a.remove();
+ a.querySelector('.aviso-orig').onclick=()=>{a.remove();status('Abriendo el modelo original, sin optimizar…');loadFile(files,{original:true})};
+ $('escenaVista').append(a);setTimeout(()=>a.remove(),15000);
+ status(`Modelo optimizado: ${fmt(antes)} → ${fmt(despues)} triángulos. Si prefieres el original, pulsa «Usar original».`);
+}
+async function loadFile(files,{original=false}={}){if(!files?.length)return;files=[...files];let simp=null;let cleanup=()=>{},missingTextures=null;status('Leyendo archivos locales…');try{
   const bundle=chooseModelBundle(files),file=bundle.main,ext=file.name.split('.').pop().toLowerCase();
   const buf=await file.arrayBuffer();let object;
   if(ext==='stl'){const geo=new STLLoader().parse(buf);geo.computeVertexNormals();object=new THREE.Mesh(geo,new THREE.MeshStandardMaterial({color:0x58b7f6,roughness:.6,side:THREE.DoubleSide}));object.name=file.name.replace(/\.stl$/i,'')}
@@ -709,7 +761,9 @@ async function loadFile(files){if(!files?.length)return;let cleanup=()=>{},missi
   else if(ext==='fbx'){object=new FBXLoader().parse(buf,'')}
   else if(ext==='3mf'){object=new ThreeMFLoader().parse(buf)}
   else throw Error('Formato no admitido');
+  if(!original)simp=await simplificarAuto(object);
   prepare(object,file.name.replace(/\.[^.]+$/,''));
+  if(simp)avisoSimplificado(simp,files);
   if(ext==='obj'&&bundle.mtl)status(`${meshes.length} malla(s) cargadas con materiales OBJ locales.${missingTextures?.size?' Faltan texturas: '+[...missingTextures].join(', ')+'.':''} Revisa el diagnóstico antes de cortar.`);
 }catch(e){cleanup();console.error(e);status('No se pudo abrir el modelo: '+e.message)}}
 $('openBtn').onclick=()=>$('file').click();$('file').onchange=e=>{loadFile(e.target.files);e.target.value=''};

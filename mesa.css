@@ -381,3 +381,8 @@ body.con-mesa .mobile-dock,body.con-mesa .mobile-sheet-backdrop{display:none!imp
 .anillo-pincel::after{content:"";position:absolute;left:50%;top:50%;width:4px;height:4px;margin:-2px;border-radius:50%;background:#ffd23f;box-shadow:0 0 0 1px #000a}
 .anillo-pincel.quitar{border-color:#ff6b6b;background:#ff6b6b22}
 .anillo-pincel.quitar::after{background:#ff6b6b}
+
+/* Aviso de modelo optimizado al abrir */
+.aviso-simp{align-items:center;flex-wrap:wrap}
+.aviso-simp>span{flex:1 1 220px}
+.aviso-simp .aviso-orig{flex:none;padding:7px 12px;border-radius:9px;border:1px solid #4aa8ff;background:#123a6b;color:#eaf4ff;font:600 13px system-ui,sans-serif;cursor:pointer}
